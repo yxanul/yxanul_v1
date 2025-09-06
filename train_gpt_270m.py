@@ -343,21 +343,19 @@ class GPT(nn.Module):
 # Distributed data loader
 
 def _load_data_shard(file: Path):
-    # Load binary file as uint16 tokens
+    # Memory-map the file to avoid loading into RAM
     if isinstance(file, str):
         file = Path(file)
     
-    print(f"Loading data from: {file}")
+    print(f"Memory-mapping data from: {file}")
     
-    # Read the binary file directly
+    # Use numpy memory mapping
     import numpy as np
-    tokens = np.fromfile(str(file), dtype=np.uint16)
+    tokens = np.memmap(str(file), dtype=np.uint16, mode='r')
     
-    print(f"Loaded {len(tokens):,} tokens from {file.name}")
+    print(f"Memory-mapped {len(tokens):,} tokens from {file.name}")
     
-    # Convert to PyTorch tensor
-    tokens = torch.from_numpy(tokens).to(torch.int64)
-    
+    # Keep as numpy memmap, don't convert to tensor yet
     return tokens
 
 # find world_size starting indicies, such that each begins with token 2 (BOS) and local_batches don't overlap
@@ -373,7 +371,7 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
     return starts, local_batch_size
 
 def data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
-    # Simplified data generator - load once and sample randomly
+    # Simplified data generator - memory-map and sample randomly
     # Handle both single file and glob pattern
     if os.path.isfile(filename_pattern):
         files = [Path(filename_pattern)]
@@ -383,24 +381,27 @@ def data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
     if not files:
         raise ValueError(f"No files found matching: {filename_pattern}")
     
-    # Load the first (or only) file
-    tokens = _load_data_shard(files[0])
-    length = tokens.numel()
+    # Memory-map the first (or only) file
+    tokens = _load_data_shard(files[0])  # This is now a numpy memmap
+    length = len(tokens)
     
     # Ensure we have enough tokens
     if length < batch_size + 1:
         raise ValueError(f"Data file too small: {length} tokens, need at least {batch_size + 1}")
     
+    import numpy as np
+    
     while True:
         # Random sampling like in deep_narrow_270_m_single_gpu.py
-        start = torch.randint(0, length - batch_size - 1, (1,)).item()
+        start = np.random.randint(0, length - batch_size - 1)
         
+        # Extract a slice from memmap and convert to tensor
         buf = tokens[start:start + batch_size + 1]
-        # Ensure we have valid non-empty tensors
-        assert buf.numel() == batch_size + 1, f"Invalid buffer size: {buf.numel()}"
+        buf_tensor = torch.from_numpy(buf.astype(np.int64))
         
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        # Split into inputs and targets
+        inputs = buf_tensor[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf_tensor[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         
         # Double-check shapes
         assert inputs.shape[0] == batch_size, f"Invalid input shape: {inputs.shape}"
