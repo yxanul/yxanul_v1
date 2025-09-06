@@ -621,7 +621,7 @@ class MuonSingleGPU(torch.optim.Optimizer):
                     # Iterations (5 is a good compromise on BF16)
                     for _ in range(ns_iters):
                         Tm = 0.5 * (3*I - Z @ (Y @ Y.transpose(0,1)) @ Z)
-                        Y = Y @ Tm
+                        Y = Tm @ Y  # Left-multiply for correct dimensions
                         Z = Tm @ Z
                     upd = Y * frob  # rescale back
 
