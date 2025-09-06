@@ -292,12 +292,13 @@ class CausalSelfAttention(nn.Module):
         self.rope = rope
         self.scale_const = 0.12  # empirical constant scale
 
-        # Two lambdas for injecting value embeddings into V path (like reference)
+        # Two lambdas for V mixing - ALL layers need these (like reference)
+        # Initialize as [0.5, 0.5] for layers with value embeds, [1.0, 0.0] for others
         if self.use_value_embed and self.value_embedder is not None:
-            # Initialize as [0.5, 0.5] like reference SA lambdas
             self.sa_lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         else:
-            self.register_parameter('sa_lambdas', None)
+            # Layers without value embeds still need lambdas (v = lambdas[0] * v)
+            self.sa_lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
     def _sliding_blockmask(self, T: int, window_tokens: int, block_size: int) -> Optional[BlockMask]:
         if not HAS_FLEX:
@@ -329,15 +330,15 @@ class CausalSelfAttention(nn.Module):
         # RoPE on first half channels
         q, k = apply_rope(q, k, self.rope, pos)
 
-        # Optional Value Embedding injection with two lambdas (like reference)
+        # Value mixing with lambdas (all layers have sa_lambdas)
         if self.use_value_embed and self.value_embedder is not None:
             ve = self.value_embedder(tokens)  # [B,T,D]
             ve = ve.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
             # Use two lambdas like reference: v = lambdas[0] * v + lambdas[1] * ve
             v = self.sa_lambdas[0] * v + self.sa_lambdas[1] * ve
         else:
-            # When no value embedding, scale v by first lambda (start at 0.5)
-            v = v * 0.5
+            # When no value embedding, use lambdas[0] * v (lambdas[1] would be 0)
+            v = self.sa_lambdas[0] * v
 
         # Attention computation: FlexAttention (if available) or SDPA fallback
         if HAS_FLEX:
@@ -398,10 +399,9 @@ class ValueEmbeddings(nn.Module):
     def __init__(self, vocab_size: int, d_model: int, n_tables: int = 2):
         super().__init__()
         self.tables = nn.ModuleList([nn.Embedding(vocab_size, d_model) for _ in range(n_tables)])
-        # Slightly tighter uniform init
-        bound = 0.5 / math.sqrt(d_model)
+        # Zero-initialize value embeddings for stability (they're mixed with lambdas starting at 0.5)
         for tab in self.tables:
-            nn.init.uniform_(tab.weight, -bound, bound)
+            nn.init.zeros_(tab.weight)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         # Sum all tables (could be concatenated + linear proj; keeping simple)
@@ -518,7 +518,8 @@ class GPT(nn.Module):
         pos = torch.arange(T, device=device, dtype=torch.long)  # positions 0..T-1
 
         x = self.embed(tokens)
-        x = self.ln_f(x)  # CRITICAL: normalize embeddings like in reference
+        # CRITICAL: Use non-learnable norm for embeddings (like reference uses norm() function)
+        x = F.rms_norm(x, (x.size(-1),))
         x0 = x  # save normalized input stream for U-Net skips
 
         for blk in self.blocks:
@@ -825,7 +826,7 @@ def train(cfg: Config, data_path: Optional[str] = None):
     # CRITICAL: Cast embeddings to bfloat16 (like reference)
     for m in model.modules():
         if isinstance(m, nn.Embedding):
-            m.to(dtype=torch.bfloat16)
+            m.bfloat16()  # This actually modifies in place
 
     # Try compile for fused kernels / better scheduling
     if cfg.compile:
