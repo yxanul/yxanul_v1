@@ -225,7 +225,8 @@ class GPT(nn.Module):
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=False)  # Disable FP8 to avoid reshape issues
-        self.lm_head.weight.detach().zero_() # @Grad62304977
+        # Don't zero-initialize LM head - use small random init instead
+        nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
         pad = (-num_layers * 5) % 1  # Single GPU, no padding needed
@@ -458,9 +459,14 @@ print0("="*100)
 
 # Deep & Narrow 270M model: 38 layers, 640 dim, 5 heads
 model: nn.Module = GPT(vocab_size=32768, num_layers=38, num_heads=5, model_dim=640, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+
+# Cast model to bfloat16 FIRST
+model = model.bfloat16()
+
+# Then ensure embeddings are also bfloat16
 for m in model.modules():
     if isinstance(m, nn.Embedding):
-        m.bfloat16()
+        m.weight.data = m.weight.data.bfloat16()
 
 # collect the parameters to optimize
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
@@ -528,9 +534,21 @@ warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 train_loader = data_generator(args.train_files, args.train_seq_len, align_to_bos=True)
+
+# Debug: Check initial loss before any training
+print("Testing initial loss...")
+with torch.no_grad():
+    test_inputs, test_targets = next(train_loader)
+    test_loss = model(test_inputs, test_targets, get_window_size_blocks(1))
+    print(f"Initial loss (before warmup): {test_loss.item():.4f}")
+    # Check for reasonable vocab predictions
+    print(f"Input token range: {test_inputs.min().item()}-{test_inputs.max().item()}")
+    print(f"Target token range: {test_targets.min().item()}-{test_targets.max().item()}")
+
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(1)).backward()
+    loss = model(inputs, targets, get_window_size_blocks(1))
+    loss.backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
