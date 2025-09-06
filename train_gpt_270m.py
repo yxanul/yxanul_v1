@@ -21,85 +21,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
-# Custom operators: FP8 matmul by @YouJiacheng
-
-@torch.library.custom_op("nanogpt::mm", mutates_args=())
-def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
-    @torch.compile
-    def impl(x: Tensor, w: Tensor):
-        assert x.is_contiguous() and w.is_contiguous()
-        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
-        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
-        out = torch._scaled_mm(
-            x_f8,
-            w_f8.T,
-            out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(w_s, dtype=torch.float32),
-            use_fast_accum=True,
-        )
-        return out, x_f8, w_f8
-
-    return impl(x, w)
-
-@mm_op.register_fake
-def _(x: Tensor, w: Tensor, *_):
-    assert x.ndim == w.ndim == 2
-    assert x.shape[1] == w.shape[1]
-    assert x.device == w.device
-    assert x.is_contiguous() and w.is_contiguous()
-    return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
-
-@torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
-def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
-    @torch.compile
-    def impl(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
-        assert grad.is_contiguous()
-        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
-        w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
-        grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
-        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
-        grad_x = torch._scaled_mm(
-            grad_f8,
-            w_f8.T.contiguous().T,
-            out_dtype=torch.bfloat16,
-            scale_a=grad_inv_s,
-            scale_b=w_inv_s,
-            use_fast_accum=False,
-        )
-        # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
-        grad_w = torch._scaled_mm(
-            x_f8.T.contiguous(),
-            grad_f8.T.contiguous().T,
-            out_dtype=torch.float32,
-            scale_a=x_inv_s,
-            scale_b=grad_inv_s,
-            use_fast_accum=False,
-        ).T
-        return grad_x, grad_w
-
-    return impl(g, x_f8, w_f8)
-
-@mm_backward_op.register_fake
-def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
-    return x_f8.to(torch.bfloat16), w_f8.T.contiguous().T.to(torch.float32)
-
-def backward(ctx, grad_out: Tensor, *_):
-    x_f8, w_f8 = ctx.saved_tensors
-    x_s, w_s, grad_s = ctx.scales
-    grad_x, grad_w = torch.ops.nanogpt.mm_backward(
-        grad_out, x_f8, w_f8, x_s, w_s, grad_s
-    )
-    return grad_x, grad_w, None, None, None
-
-def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
-    *_, x_s, w_s, grad_s = inputs
-    _, x_f8, w_f8 = output
-    ctx.save_for_backward(x_f8, w_f8)
-    ctx.scales = x_s, w_s, grad_s
-    ctx.set_materialize_grads(False)
-
-mm_op.register_autograd(backward, setup_context=setup_context)
+# Removed FP8 custom operators - using standard PyTorch ops for simplicity
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -190,12 +112,9 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
+    def __init__(self, in_features: int, out_features: int, use_fp8=False):
         super().__init__(in_features, out_features, bias=False)
-        self.use_fp8 = use_fp8
-        self.x_s = x_s
-        self.w_s = w_s
-        self.grad_s = grad_s
+        # Simplified - always use standard linear, ignore FP8 flag
 
     def reset_parameters(self) -> None:
         std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
@@ -204,12 +123,8 @@ class CastedLinear(nn.Linear):
             self.weight.uniform_(-bound, bound)
 
     def forward(self, x: Tensor):
-        if self.use_fp8 and self.training:
-            _x = x.flatten(0, -2)
-            out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
-            return out.reshape(*x.shape[:-1], -1)
-        else:
-            return F.linear(x, self.weight.type_as(x))
+        # Always use standard F.linear (no FP8 complications)
+        return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -309,7 +224,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=False)  # Disable FP8 to avoid reshape issues
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
