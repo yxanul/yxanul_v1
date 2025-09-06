@@ -476,8 +476,8 @@ def data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "train.bin" # input .bin to train on
-    val_files = "val.bin" # input .bin to eval validation loss on
+    train_files = "/workspace/yxanul_v1/mixed_6b/train.bin" # input .bin to train on
+    val_files = "/workspace/yxanul_v1/mixed_6b/train.bin" # using train for val temporarily
     val_tokens = 1048576 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_seq_len = 8*1024 # FlexAttention sequence length
     val_seq_len = 64*1024 # FlexAttention sequence length for validation
