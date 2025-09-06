@@ -343,12 +343,22 @@ class GPT(nn.Module):
 # Distributed data loader
 
 def _load_data_shard(file: Path):
-    # Use torch.from_file to memory-map the data (avoids loading entire file into RAM)
-    # This matches deep_narrow_270_m_single_gpu.py approach
+    # Load binary file as uint16 tokens
     if isinstance(file, str):
         file = Path(file)
-    tokens = torch.from_file(str(file), dtype=torch.int16).to(torch.int32)
-    return tokens.to(torch.int64)  # Convert to int64 for indexing
+    
+    print(f"Loading data from: {file}")
+    
+    # Read the binary file directly
+    import numpy as np
+    tokens = np.fromfile(str(file), dtype=np.uint16)
+    
+    print(f"Loaded {len(tokens):,} tokens from {file.name}")
+    
+    # Convert to PyTorch tensor
+    tokens = torch.from_numpy(tokens).to(torch.int64)
+    
+    return tokens
 
 # find world_size starting indicies, such that each begins with token 2 (BOS) and local_batches don't overlap
 def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
