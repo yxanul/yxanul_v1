@@ -212,22 +212,24 @@ class GPT(nn.Module):
 # -----------------------------------------------------------------------------
 # Simple data loader for single GPU
 
-def data_generator(file_path: str, batch_size: int):
-    # Memory-map the file to avoid loading into RAM
-    import numpy as np
-    print(f"Memory-mapping data from: {file_path}")
-    tokens = np.memmap(file_path, dtype=np.uint16, mode='r')
-    print(f"Memory-mapped {len(tokens):,} tokens")
-    length = len(tokens)
+class DataLoader:
+    def __init__(self, file_path: str):
+        # Memory-map the file once to avoid loading into RAM
+        import numpy as np
+        print(f"Memory-mapping data from: {file_path}")
+        self.tokens = np.memmap(file_path, dtype=np.uint16, mode='r')
+        self.length = len(self.tokens)
+        print(f"Memory-mapped {self.length:,} tokens")
     
-    while True:
+    def get_batch(self, batch_size: int):
+        import numpy as np
         # Random sampling
-        start = np.random.randint(0, length - batch_size - 1)
-        buf = tokens[start:start + batch_size + 1]
+        start = np.random.randint(0, self.length - batch_size - 1)
+        buf = self.tokens[start:start + batch_size + 1]
         buf_tensor = torch.from_numpy(buf.astype(np.int64))
         inputs = buf_tensor[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
         targets = buf_tensor[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
-        yield inputs, targets
+        return inputs, targets
 
 # -----------------------------------------------------------------------------
 # int main
@@ -237,15 +239,17 @@ class Hyperparameters:
     # data
     train_file = "/workspace/yxanul_v1/mixed_6b/train.bin" # YOUR dataset
     val_file = "/workspace/yxanul_v1/mixed_6b/train.bin" # using train for val temporarily
-    val_tokens = 1048576 # how many tokens of validation data?
-    train_seq_len = 8*1024 # sequence length for training
-    val_seq_len = 8*1024 # sequence length for validation
+    val_tokens = 4*1024*1024 # 4M tokens for validation
+    train_seq_len = 32*1024 # 32K sequence length (4x increase)
+    val_seq_len = 32*1024 # 32K for validation too
     # optimization
     num_iterations = 2000 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss?
     save_checkpoint = False
+    # You can also try gradient accumulation if needed
+    gradient_accumulation_steps = 1  # increase if you run out of memory
 args = Hyperparameters()
 
 # Single GPU setup
@@ -317,8 +321,11 @@ def get_window_size_blocks_helper(window_size: int):
 def get_window_size_blocks(step: int):
     x = step / args.num_iterations # progress in training
     assert 0 <= x <= 1
-    # Linearly increase the block-wise sliding window size over training 128 -> 1792
-    window_size = next_multiple_of_n(128 + 1664 * x, n=128)
+    # Linearly increase the block-wise sliding window size over training 
+    # Start at 256 tokens, grow to full sequence length
+    start_window = 256
+    end_window = min(8192, args.train_seq_len)  # Cap at 8K for memory efficiency
+    window_size = next_multiple_of_n(start_window + (end_window - start_window) * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
 model: nn.Module = torch.compile(model, dynamic=False)
@@ -327,7 +334,10 @@ model: nn.Module = torch.compile(model, dynamic=False)
 #        Training and validation       #
 ########################################
 
-train_loader = data_generator(args.train_file, args.train_seq_len)
+# Create data loaders once
+train_loader = DataLoader(args.train_file)
+val_loader = DataLoader(args.val_file) if args.val_file != args.train_file else train_loader
+
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -343,13 +353,13 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        val_loader = data_generator(args.val_file, args.val_seq_len)
         val_loss = 0
+        val_batches = args.val_tokens // args.val_seq_len
         with torch.no_grad():
-            for _ in range(4):  # 4 validation batches
-                inputs, targets = next(val_loader)
+            for _ in range(val_batches):
+                inputs, targets = val_loader.get_batch(args.val_seq_len)
                 val_loss += model(inputs, targets, get_window_size_blocks(step)).item()
-        val_loss /= 4
+        val_loss /= val_batches
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
         # start the clock again
@@ -361,7 +371,7 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
+    inputs, targets = train_loader.get_batch(args.train_seq_len)
     loss = model(inputs, targets, get_window_size_blocks(step))
     loss.backward()
     
@@ -383,7 +393,9 @@ for step in range(train_steps + 1):
     # logging
     if step % 50 == 0:
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} loss:{loss.item():.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+        tokens_processed = (step + 1) * args.train_seq_len
+        tokens_per_sec = tokens_processed / (approx_training_time_ms / 1000) if approx_training_time_ms > 0 else 0
+        print0(f"step:{step+1}/{train_steps} loss:{loss.item():.4f} | {tokens_per_sec:.0f} tok/s | train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
