@@ -240,16 +240,16 @@ class Hyperparameters:
     train_file = "/workspace/yxanul_v1/mixed_6b/train.bin" # YOUR dataset
     val_file = "/workspace/yxanul_v1/mixed_6b/train.bin" # using train for val temporarily
     val_tokens = 4*1024*1024 # 4M tokens for validation
-    train_seq_len = 32*1024 # 32K sequence length (4x increase)
-    val_seq_len = 32*1024 # 32K for validation too
+    train_seq_len = 64*1024 # 64K sequence length (8x increase from original)
+    val_seq_len = 64*1024 # 64K for validation too
     # optimization
     num_iterations = 2000 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss?
     save_checkpoint = False
-    # You can also try gradient accumulation if needed
-    gradient_accumulation_steps = 1  # increase if you run out of memory
+    # Gradient accumulation for larger effective batch size
+    gradient_accumulation_steps = 4  # effective batch size = 64K * 4 = 256K tokens
 args = Hyperparameters()
 
 # Single GPU setup
@@ -373,29 +373,37 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = train_loader.get_batch(args.train_seq_len)
     loss = model(inputs, targets, get_window_size_blocks(step))
+    # Scale loss for gradient accumulation
+    loss = loss / args.gradient_accumulation_steps
     loss.backward()
     
-    # Gradient clipping
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    
-    # Set learning rate
-    for group in optimizer.param_groups:
-        base_lr = group.get('_base_lr', group['lr'])
-        if '_base_lr' not in group:
-            group['_base_lr'] = base_lr
-        group['lr'] = base_lr * get_lr(step)
-    
-    # step the optimizer
-    optimizer.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
+    # Only update weights every gradient_accumulation_steps
+    if (step + 1) % args.gradient_accumulation_steps == 0:
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
+        # Set learning rate
+        for group in optimizer.param_groups:
+            base_lr = group.get('_base_lr', group['lr'])
+            if '_base_lr' not in group:
+                group['_base_lr'] = base_lr
+            group['lr'] = base_lr * get_lr(step)
+        
+        # step the optimizer
+        optimizer.step()
+        # null the gradients
+        model.zero_grad(set_to_none=True)
     
     # logging
     if step % 50 == 0:
         approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
         tokens_processed = (step + 1) * args.train_seq_len
         tokens_per_sec = tokens_processed / (approx_training_time_ms / 1000) if approx_training_time_ms > 0 else 0
-        print0(f"step:{step+1}/{train_steps} loss:{loss.item():.4f} | {tokens_per_sec:.0f} tok/s | train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+        # Show unscaled loss in logging
+        actual_loss = loss.item() * args.gradient_accumulation_steps
+        mem_alloc = torch.cuda.memory_allocated() // 1024 // 1024
+        mem_reserved = torch.cuda.memory_reserved() // 1024 // 1024
+        print0(f"step:{step+1}/{train_steps} loss:{actual_loss:.4f} | {tokens_per_sec:.0f} tok/s | mem:{mem_alloc}/{mem_reserved}MiB | train_time:{approx_training_time_ms:.0f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
