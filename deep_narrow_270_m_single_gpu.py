@@ -288,14 +288,16 @@ class CausalSelfAttention(nn.Module):
 
         self.q_norm = RMSNorm(head_dim)
         self.k_norm = RMSNorm(head_dim)
+        # NO v_norm - reference doesn't normalize V
         self.rope = rope
         self.scale_const = 0.12  # empirical constant scale
 
-        # Lambda for injecting value embeddings into V path
+        # Two lambdas for injecting value embeddings into V path (like reference)
         if self.use_value_embed and self.value_embedder is not None:
-            self.sa_lambda = nn.Parameter(torch.zeros(1))  # start at 0 (learn upwards)
+            # Initialize as [0.5, 0.5] like reference SA lambdas
+            self.sa_lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         else:
-            self.register_parameter('sa_lambda', None)
+            self.register_parameter('sa_lambdas', None)
 
     def _sliding_blockmask(self, T: int, window_tokens: int, block_size: int) -> Optional[BlockMask]:
         if not HAS_FLEX:
@@ -320,18 +322,22 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # QK RMSNorm per head
+        # QK RMSNorm per head (NO V norm - reference doesn't do it)
         q = self.q_norm(q)
         k = self.k_norm(k)
 
         # RoPE on first half channels
         q, k = apply_rope(q, k, self.rope, pos)
 
-        # Optional Value Embedding injection
+        # Optional Value Embedding injection with two lambdas (like reference)
         if self.use_value_embed and self.value_embedder is not None:
             ve = self.value_embedder(tokens)  # [B,T,D]
             ve = ve.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-            v = v + torch.tanh(self.sa_lambda) * ve
+            # Use two lambdas like reference: v = lambdas[0] * v + lambdas[1] * ve
+            v = self.sa_lambdas[0] * v + self.sa_lambdas[1] * ve
+        else:
+            # When no value embedding, scale v by first lambda (start at 0.5)
+            v = v * 0.5
 
         # Attention computation: FlexAttention (if available) or SDPA fallback
         if HAS_FLEX:
@@ -512,7 +518,8 @@ class GPT(nn.Module):
         pos = torch.arange(T, device=device, dtype=torch.long)  # positions 0..T-1
 
         x = self.embed(tokens)
-        x0 = x  # save input stream for U-Net skips
+        x = self.ln_f(x)  # CRITICAL: normalize embeddings like in reference
+        x0 = x  # save normalized input stream for U-Net skips
 
         for blk in self.blocks:
             x = blk(x, x0, tokens, pos, window_tokens, block_size)
@@ -814,6 +821,11 @@ def train(cfg: Config, data_path: Optional[str] = None):
     # Build model
     model = GPT(cfg).to(device)
     model = model.to(dtype=cfg.dtype)
+    
+    # CRITICAL: Cast embeddings to bfloat16 (like reference)
+    for m in model.modules():
+        if isinstance(m, nn.Embedding):
+            m.to(dtype=torch.bfloat16)
 
     # Try compile for fused kernels / better scheduling
     if cfg.compile:
