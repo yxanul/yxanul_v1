@@ -240,8 +240,8 @@ class Hyperparameters:
     train_file = "/workspace/yxanul_v1/mixed_6b/train.bin" # YOUR dataset
     val_file = "/workspace/yxanul_v1/mixed_6b/train.bin" # using train for val temporarily
     val_tokens = 4*1024*1024 # 4M tokens for validation
-    train_seq_len = 64*1024 # 64K sequence length (8x increase from original)
-    val_seq_len = 64*1024 # 64K for validation too
+    train_seq_len = 256*1024 # 256K sequence length - aggressive increase
+    val_seq_len = 256*1024 # 256K for validation too
     # optimization
     num_iterations = 2000 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
@@ -249,7 +249,7 @@ class Hyperparameters:
     val_loss_every = 125 # every how many steps to evaluate val loss?
     save_checkpoint = False
     # Gradient accumulation for larger effective batch size
-    gradient_accumulation_steps = 4  # effective batch size = 64K * 4 = 256K tokens
+    gradient_accumulation_steps = 8  # effective batch size = 256K * 8 = 2M tokens
 args = Hyperparameters()
 
 # Single GPU setup
@@ -277,7 +277,8 @@ print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.ve
 
 # GPT-2 small model: 12 layers, 768 dim, 12 heads (125M params)
 # Change vocab_size to 32768 for your tokenizer
-model: nn.Module = GPT(vocab_size=32768, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+# Deep & narrow 270M config: 38 layers, 640 dim, 5 heads
+model: nn.Module = GPT(vocab_size=32768, num_layers=38, num_heads=5, model_dim=640, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
 
 # Cast embeddings to bfloat16
 model = model.bfloat16()
