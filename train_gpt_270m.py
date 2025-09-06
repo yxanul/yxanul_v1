@@ -17,9 +17,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
-# DISABLED for now due to empty tensor issues
-# from torch.nn.attention.flex_attention import BlockMask, flex_attention
-BlockMask, flex_attention = None, None
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
