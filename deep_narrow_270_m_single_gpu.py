@@ -345,18 +345,22 @@ class CausalSelfAttention(nn.Module):
             out = flex_attention(q, k, v, score_mod, value_mod, block_mask=mask)
         else:
             # Use SDPA with an additive sliding window causal mask
-            # Build [T,T] mask: True=keep, False=mask
             device = x.device
             idx = torch.arange(T, device=device)
             # Allow attend to last window_tokens within past
-            allowed = (idx.view(T,1) - idx.view(1,T))
+            allowed = (idx.view(T, 1) - idx.view(1, T))
             # allowed >= 0 (no future) and allowed < window_tokens
             causal = (allowed >= 0) & (allowed < window_tokens)
-            attn_mask = torch.where(causal, 0.0, float('-inf')).to(x.dtype)  # [T,T]
+            
+            # IMPORTANT: keep mask in float32 to avoid bf16/-inf NaNs
+            attn_mask = torch.empty((T, T), device=device, dtype=torch.float32)
+            attn_mask[causal] = 0.0
+            attn_mask[~causal] = float('-inf')
+            
+            # Pass the scale to SDPA (scale the *scores*, not the output)
             out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, scale=None, is_causal=False
+                q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.scale_const
             )
-            out = out * self.scale_const
 
         # Merge heads
         out = out.transpose(1, 2).contiguous().view(B, T, C)
@@ -487,8 +491,8 @@ class GPT(nn.Module):
         ])
 
         self.ln_f = RMSNorm(cfg.d_model)
-        # Separate LM head (untied), FP8-ish attempt
-        self.lm_head = CastedLinear(cfg.d_model, self.vocab_size, use_fp8=True, zero_init=True)
+        # Separate LM head (untied) -- run in bf16 for stability during bring-up
+        self.lm_head = CastedLinear(cfg.d_model, self.vocab_size, use_fp8=False, zero_init=True)
 
     def forward(self, tokens: torch.Tensor, step: int, train_mode: bool,
                 window_tokens: int, block_size: int) -> torch.Tensor:
@@ -686,12 +690,18 @@ def current_window(step: int, cfg: Config) -> int:
     return int(min(win, cfg.max_window_tokens))
 
 
-def cosine_cooldown_lr(step: int, total_steps: int, cooldown_frac: float) -> float:
-    """Flat LR, then cosine decay to 10% of base across the cooldown window."""
+def cosine_cooldown_lr(step: int, total_steps: int, cooldown_frac: float, warmup_steps: int = 200) -> float:
+    """Linear warmup, then flat LR, then cosine decay to 10% of base."""
+    # Warmup phase
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    
+    # Flat phase
     cutoff = int((1.0 - cooldown_frac) * total_steps)
     if step < cutoff:
         return 1.0
-    # cosine from 1.0 down to 0.1
+    
+    # Cosine cooldown from 1.0 down to 0.1
     t = (step - cutoff) / max(1, (total_steps - cutoff))
     return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * t))
 
