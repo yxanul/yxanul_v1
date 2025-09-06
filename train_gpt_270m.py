@@ -426,16 +426,13 @@ class GPT(nn.Module):
 # Distributed data loader
 
 def _load_data_shard(file: Path):
-    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
-    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-    assert header[1] == 1, "unsupported version"
-    num_tokens = int(header[2]) # number of tokens (claimed)
+    # Simple loader without header check - your data was created without the nanogpt header format
     with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
-        f.seek(256 * 4)
-        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
-        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
-    return tokens
+        # Read entire file
+        data = f.read()
+        # Convert to uint16 tensor
+        tokens = torch.frombuffer(data, dtype=torch.uint16)
+    return tokens.long()  # Convert to long for indexing
 
 # find world_size starting indicies, such that each begins with token 2 (BOS) and local_batches don't overlap
 def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
