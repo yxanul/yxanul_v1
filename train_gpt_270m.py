@@ -17,7 +17,9 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import BlockMask, flex_attention
+# DISABLED for now due to empty tensor issues
+# from torch.nn.attention.flex_attention import BlockMask, flex_attention
+BlockMask, flex_attention = None, None
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
@@ -375,16 +377,25 @@ def data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
     tokens = _load_data_shard(files[0])
     length = tokens.numel()
     
+    # Ensure we have enough tokens
+    if length < batch_size + 1:
+        raise ValueError(f"Data file too small: {length} tokens, need at least {batch_size + 1}")
+    
     while True:
         # Random sampling like in deep_narrow_270_m_single_gpu.py
-        if length <= batch_size + 1:
-            start = 0
-        else:
-            start = torch.randint(0, length - batch_size - 1, (1,)).item()
+        start = torch.randint(0, length - batch_size - 1, (1,)).item()
         
         buf = tokens[start:start + batch_size + 1]
+        # Ensure we have valid non-empty tensors
+        assert buf.numel() == batch_size + 1, f"Invalid buffer size: {buf.numel()}"
+        
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        
+        # Double-check shapes
+        assert inputs.shape[0] == batch_size, f"Invalid input shape: {inputs.shape}"
+        assert targets.shape[0] == batch_size, f"Invalid target shape: {targets.shape}"
+        
         yield inputs, targets
 
 # -----------------------------------------------------------------------------
