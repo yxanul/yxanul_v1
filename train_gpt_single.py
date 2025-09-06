@@ -182,7 +182,14 @@ class GPT(nn.Module):
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        # Generate block masks pattern for any number of layers
+        # Pattern: long, short, short, short repeating
+        block_masks = []
+        for i in range(len(self.blocks)):
+            if i % 4 == 0:
+                block_masks.append(long_bm)
+            else:
+                block_masks.append(short_bm)
         assert len(block_masks) == len(self.blocks)
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
@@ -240,8 +247,8 @@ class Hyperparameters:
     train_file = "/workspace/yxanul_v1/mixed_6b/train.bin" # YOUR dataset
     val_file = "/workspace/yxanul_v1/mixed_6b/train.bin" # using train for val temporarily
     val_tokens = 4*1024*1024 # 4M tokens for validation
-    train_seq_len = 256*1024 # 256K sequence length - aggressive increase
-    val_seq_len = 256*1024 # 256K for validation too
+    train_seq_len = 16*1024 # 16K sequence length for 270M model
+    val_seq_len = 16*1024 # 16K for validation too
     # optimization
     num_iterations = 2000 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
@@ -249,7 +256,7 @@ class Hyperparameters:
     val_loss_every = 125 # every how many steps to evaluate val loss?
     save_checkpoint = False
     # Gradient accumulation for larger effective batch size
-    gradient_accumulation_steps = 8  # effective batch size = 256K * 8 = 2M tokens
+    gradient_accumulation_steps = 16  # effective batch size = 16K * 16 = 256K tokens
 args = Hyperparameters()
 
 # Single GPU setup
