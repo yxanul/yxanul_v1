@@ -178,13 +178,15 @@ class RotaryCache:
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         # Use half the dims for rotation
-        rot_dims = head_dim // 2
-        inv_freq = 1.0 / (base ** (torch.arange(0, rot_dims, 2).float() / rot_dims))
+        rot_dims = head_dim // 2  # channels under rotation (e.g., 64)
+        pair_dims = rot_dims // 2  # number of (even,odd) pairs (e.g., 32)
+        
+        inv_freq = 1.0 / (base ** (torch.arange(0, pair_dims, 1).float() / pair_dims))
         t = torch.arange(max_seq_len, dtype=torch.float32)
-        freqs = torch.einsum('i,j->ij', t, inv_freq)  # [T, rot_dims/2]
-        emb = torch.cat([freqs, freqs], dim=-1)       # duplicate for sin/cos pairing
-        self.cos_cached = emb.cos()  # [T, rot_dims]
-        self.sin_cached = emb.sin()  # [T, rot_dims]
+        freqs = torch.einsum('i,j->ij', t, inv_freq)  # [T, pair_dims]
+        
+        self.cos_cached = freqs.cos()  # [T, pair_dims] - shape matches even/odd splits
+        self.sin_cached = freqs.sin()  # [T, pair_dims]
 
     def to(self, device, dtype):
         self.cos_cached = self.cos_cached.to(device=device, dtype=dtype)
