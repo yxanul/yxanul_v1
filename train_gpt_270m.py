@@ -426,13 +426,12 @@ class GPT(nn.Module):
 # Distributed data loader
 
 def _load_data_shard(file: Path):
-    # Simple loader without header check - your data was created without the nanogpt header format
-    with file.open("rb", buffering=0) as f:
-        # Read entire file
-        data = f.read()
-        # Convert to uint16 tensor
-        tokens = torch.frombuffer(data, dtype=torch.uint16)
-    return tokens.long()  # Convert to long for indexing
+    # Use torch.from_file to memory-map the data (avoids loading entire file into RAM)
+    # This matches deep_narrow_270_m_single_gpu.py approach
+    if isinstance(file, str):
+        file = Path(file)
+    tokens = torch.from_file(str(file), dtype=torch.int16).to(torch.int32)
+    return tokens.to(torch.int64)  # Convert to int64 for indexing
 
 # find world_size starting indicies, such that each begins with token 2 (BOS) and local_batches don't overlap
 def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
@@ -447,24 +446,30 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
     return starts, local_batch_size
 
 def data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
-    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
-    local_batch_size = batch_size
-    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
-    tokens, pos = _load_data_shard(next(file_iter)), 0
-    max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
+    # Simplified data generator - load once and sample randomly
+    # Handle both single file and glob pattern
+    if os.path.isfile(filename_pattern):
+        files = [Path(filename_pattern)]
+    else:
+        files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+    
+    if not files:
+        raise ValueError(f"No files found matching: {filename_pattern}")
+    
+    # Load the first (or only) file
+    tokens = _load_data_shard(files[0])
+    length = tokens.numel()
+    
     while True:
-        if pos + max_batch_span + 1 >= len(tokens):
-            tokens, pos = _load_data_shard(next(file_iter)), 0
-        if align_to_bos:
-            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
-            start_idx = batch_starts[0]
+        # Random sampling like in deep_narrow_270_m_single_gpu.py
+        if length <= batch_size + 1:
+            start = 0
         else:
-            batch_span = batch_size
-            start_idx = pos
-        buf = tokens[start_idx:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
-        pos += batch_span
+            start = torch.randint(0, length - batch_size - 1, (1,)).item()
+        
+        buf = tokens[start:start + batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         yield inputs, targets
 
 # -----------------------------------------------------------------------------
