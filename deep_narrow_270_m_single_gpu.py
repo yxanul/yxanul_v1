@@ -744,9 +744,12 @@ def per_layer_grad_norms(model: GPT, layer_ids: List[int]) -> Dict[int, float]:
 
 
 def per_layer_update_ratio(model: GPT, prev: Dict[str, torch.Tensor], layer_ids: List[int]) -> Dict[int, float]:
-    """Compute ||Δθ||/||θ|| per layer, aggregated over its params."""
+    """Compute ||Δθ||/||θ|| per layer, aggregated over its params.
+    Uses max(prev_norm, curr_norm) + eps to avoid div-by-zero with zero-inits."""
+    eps = 1e-12
     num_sq = {i: 0.0 for i in layer_ids}
     den_sq = {i: 0.0 for i in layer_ids}
+    
     for n, p in model.named_parameters():
         if n not in prev:
             continue
@@ -757,12 +760,26 @@ def per_layer_update_ratio(model: GPT, prev: Dict[str, torch.Tensor], layer_ids:
             continue
         if i not in num_sq:
             continue
-        delta = (p.data - prev[n])
+        
+        cur = p.data
+        delta = cur - prev[n]
         num_sq[i] += float(delta.pow(2).sum().item())
-        den_sq[i] += float(prev[n].pow(2).sum().item()) + 1e-12
+        
+        # Robust denominator: max of prev and current norms
+        prev_norm_sq = float(prev[n].pow(2).sum().item())
+        curr_norm_sq = float(cur.pow(2).sum().item())
+        den_sq[i] += max(prev_norm_sq, curr_norm_sq)
+        
         # refresh snapshot in-place
-        prev[n] = p.data.detach().clone()
-    return {i: (num_sq[i] ** 0.5) / (den_sq[i] ** 0.5) for i in layer_ids}
+        prev[n] = cur.detach().clone()
+    
+    # Finalize with epsilon guard
+    ratios = {}
+    for i in layer_ids:
+        num = (num_sq[i] + eps) ** 0.5
+        den = (den_sq[i] + eps) ** 0.5
+        ratios[i] = num / den
+    return ratios
 
 
 def save_checkpoint(path: str, model: GPT, opt_muon, opt_adam, cfg: Config, step: int, best_val: float):
