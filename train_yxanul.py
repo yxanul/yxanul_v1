@@ -513,11 +513,15 @@ def train(cfg: TrainCfg, mcfg: ModelCfg):
         if cfg.full_attn:
             fixed_w = cfg.seq_len
             wins = [fixed_w] * mcfg.n_layers
+            log_short_w = log_long_w = fixed_w
         elif cfg.fixed_window and cfg.fixed_window > 0:
-            wins = [int(cfg.fixed_window)] * mcfg.n_layers
+            fixed_w = int(cfg.fixed_window)
+            wins = [fixed_w] * mcfg.n_layers
+            log_short_w = log_long_w = fixed_w
         else:
             short_w, long_w = window_schedule(step, cfg.warmup_steps)
             wins = layer_windows(mcfg.n_layers, short_w, long_w)
+            log_short_w, log_long_w = short_w, long_w
         model.set_layer_windows(wins)
 
         # Batch
@@ -567,8 +571,8 @@ def train(cfg: TrainCfg, mcfg: ModelCfg):
                 'lr': lr,
                 'tokens_per_sec': tps,
                 'max_mem_gb': mem_gb,
-                'short_window': short_w,
-                'long_window': long_w,
+                'short_window': log_short_w,
+                'long_window': log_long_w,
             }
             if cfg.use_wandb:
                 wandb.log(log, step=step + 1)
