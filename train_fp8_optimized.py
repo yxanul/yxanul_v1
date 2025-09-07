@@ -15,6 +15,7 @@ import os
 import math
 import time
 import json
+import random
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -75,10 +76,12 @@ class TrainingConfig:
     checkpoint_interval: int = 500
     checkpoint_dir: str = 'checkpoints_fp8_optimized'
     data_dir: str = 'data_mixed_3b'
-    
+
     # Wandb
     wandb_project: str = 'fp8-optimized'
     wandb_run_name: Optional[str] = None
+    # Reproducibility
+    seed: int = 1337
 
 
 class DataLoader:
@@ -228,6 +231,7 @@ def train():
     parser.add_argument('--no_fp8', action='store_true', help='Disable FP8')
     parser.add_argument('--no_fusion', action='store_true', help='Disable gradient fusion (always disabled in CLEAN)')
     parser.add_argument('--no_wandb', action='store_true', help='Disable Weights & Biases logging')
+    parser.add_argument('--seed', type=int, default=1337, help='Random seed for reproducibility')
     # Model overrides
     parser.add_argument('--vocab_size', type=int, help='Tokenizer vocab size (e.g., 32768)')
     parser.add_argument('--n_layer', type=int, help='Number of layers')
@@ -268,6 +272,7 @@ def train():
     config.max_iters = args.max_iters
     config.eval_interval = args.eval_interval
     config.log_interval = args.log_interval
+    config.seed = args.seed
     
     # Model configuration
     model_config = ModelConfig(
@@ -283,6 +288,12 @@ def train():
         fuse_wgrad_accumulation=False,  # Always disabled in CLEAN
     )
     
+    # Set seeds for reproducibility (keeps fast kernels; not fully deterministic)
+    torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
+    np.random.seed(config.seed)
+    random.seed(config.seed)
+
     # Create CLEAN model (the fast one)
     model = CleanGPT_TE(model_config).to(config.device)
     model = model.to(torch.bfloat16)
