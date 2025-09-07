@@ -174,25 +174,31 @@ class MultiheadGQA(nn.Module):
         # RoPE (partial)
         q, k = apply_rope(q, k, rope_fraction=self.rope_fraction, base=self.rope_base, seq_start=seq_start)
 
-        # Prepare for SDPA: (B*H, T, Dh)
-        q = q.reshape(B * self.h, T, self.dh)
-        k = k.reshape(B * self.h, T, self.dh)
-        v = v.reshape(B * self.h, T, self.dh)
+        # Keep 4D (B, H, T, Dh) to allow fused SDPA kernels when possible
 
         # Scaled dot-product attention with additive mask; prefer Flash/mem-efficient kernels
         # Note: we supply scale via the 'scale' kwarg; torch will still internally use 1/sqrt(d) unless scale is provided.
         try:
-            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
+            # Prefer new sdpa_kernel context (PyTorch >= 2.4)
+            with torch.nn.attention.sdpa_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
                 y = F.scaled_dot_product_attention(
                     q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.attn_scale
                 )
         except Exception:
             # Fallback if the provided mask or environment is unsupported by flash/mem-efficient backends
-            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.attn_scale
-                )
-        y = y.view(B, self.h, T, self.dh).permute(0, 2, 1, 3).contiguous().view(B, T, self.h * self.dh)
+            try:
+                with torch.nn.attention.sdpa_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.attn_scale
+                    )
+            except Exception:
+                # Ultimate fallback for older PyTorch
+                with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.attn_scale
+                    )
+        # y is (B, H, T, Dh)
+        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, self.h * self.dh)
         return self.wo(y)
 
 
