@@ -41,6 +41,10 @@ from torch.utils.data import Dataset, DataLoader
 def set_torch_defaults():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision('high')
+    except Exception:
+        pass
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -364,8 +368,9 @@ class MemMapTokens(Dataset):
     def __getitem__(self, _: int):
         s = random.randint(self.start, self.max_start)
         buf = self.mm[s : s + self.seq_len + 1]
-        x = torch.from_numpy(np.array(buf[:-1], copy=False))
-        y = torch.from_numpy(np.array(buf[1:], copy=False))
+        # copy=True to ensure writable arrays and avoid warnings
+        x = torch.from_numpy(np.array(buf[:-1], copy=True))
+        y = torch.from_numpy(np.array(buf[1:], copy=True))
         return x.long(), y.long()
 
 
@@ -396,8 +401,13 @@ class TrainCfg:
     device: str = 'cuda'
     compile: bool = True
     use_wandb: bool = True
-    wandb_project: str = 'optionA-270M'
+    wandb_project: str = 'optionA-270M' 
     wandb_run_name: Optional[str] = None
+    # dataloader workers
+    train_workers: int = 4
+    val_workers: int = 2
+    # timing instrumentation
+    timing: bool = False
 
 
 @dataclass
@@ -447,8 +457,8 @@ def train(cfg: TrainCfg, mcfg: ModelCfg):
     # Data
     train_ds = MemMapTokens(cfg.data_bin, cfg.seq_len, dtype=cfg.data_dtype, split='train')
     val_ds = MemMapTokens(cfg.data_bin, cfg.seq_len, dtype=cfg.data_dtype, split='val')
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=1, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.train_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.val_workers, pin_memory=True)
     train_iter = iter(train_loader)
 
     # Model
@@ -485,6 +495,9 @@ def train(cfg: TrainCfg, mcfg: ModelCfg):
     t0 = time.time()
     tokens_seen = 0
 
+    # Timing accumulators
+    fetch_t = fwd_t = bwd_t = opt_t = 0.0
+    last_log_step = 0
     for step in range(cfg.global_steps):
         # Schedules
         lr = cosine_lr(step, cfg.warmup_steps, cfg.global_steps, cfg.lr, cfg.min_lr_mult)
@@ -495,24 +508,38 @@ def train(cfg: TrainCfg, mcfg: ModelCfg):
         model.set_layer_windows(wins)
 
         # Batch
+        data_fetch_t0 = time.time()
         try:
             x, y = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
             x, y = next(train_iter)
+        fetch_t += (time.time() - data_fetch_t0)
         x = x.to(cfg.device, non_blocking=True)
         y = y.to(cfg.device, non_blocking=True)
 
         # Forward / loss
+        fwd_t0 = time.time()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             logits = model(x, seq_start=0)
             loss = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), y.reshape(-1), reduction='mean')
+        if cfg.timing and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        fwd_t += (time.time() - fwd_t0)
 
         opt.zero_grad(set_to_none=True)
+        bwd_t0 = time.time()
         loss.backward()
+        if cfg.timing and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        bwd_t += (time.time() - bwd_t0)
         if cfg.grad_clip is not None and cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        opt_t0 = time.time()
         opt.step()
+        if cfg.timing and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        opt_t += (time.time() - opt_t0)
 
         tokens_seen += x.numel()
 
@@ -534,6 +561,25 @@ def train(cfg: TrainCfg, mcfg: ModelCfg):
                 wandb.log(log, step=step + 1)
             # Always print to stdout as well for SSH visibility
             print(log)
+            if cfg.timing:
+                steps = (step + 1) - last_log_step if last_log_step > 0 else cfg.log_every
+                last_log_step = step + 1
+                avg_fetch = fetch_t / max(1, steps)
+                avg_fwd = fwd_t / max(1, steps)
+                avg_bwd = bwd_t / max(1, steps)
+                avg_opt = opt_t / max(1, steps)
+                other = max(0.0, (elapsed / max(1, step + 1)) - (avg_fetch + avg_fwd + avg_bwd + avg_opt))
+                timing_log = {
+                    'timing/fetch_s': avg_fetch,
+                    'timing/forward_s': avg_fwd,
+                    'timing/backward_s': avg_bwd,
+                    'timing/opt_s': avg_opt,
+                    'timing/other_s': other,
+                }
+                if cfg.use_wandb:
+                    wandb.log(timing_log, step=step + 1)
+                print(timing_log)
+                fetch_t = fwd_t = bwd_t = opt_t = 0.0
 
         # Eval
         if cfg.eval_every > 0 and (step + 1) % cfg.eval_every == 0:
@@ -586,6 +632,9 @@ def main():
     parser.add_argument('--wandb_project', type=str, default='optionA-270M')
     parser.add_argument('--wandb_run_name', type=str, default=None)
     parser.add_argument('--compile', action='store_true')
+    parser.add_argument('--train_workers', type=int, default=4)
+    parser.add_argument('--val_workers', type=int, default=2)
+    parser.add_argument('--timing', action='store_true')
     args = parser.parse_args()
 
     cfg = TrainCfg(
@@ -601,6 +650,9 @@ def main():
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         compile=args.compile,
+        train_workers=args.train_workers,
+        val_workers=args.val_workers,
+        timing=args.timing,
     )
 
     mcfg = ModelCfg()
