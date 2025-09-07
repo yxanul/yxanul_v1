@@ -152,8 +152,9 @@ class MultiheadGQA(nn.Module):
         nn.init.zeros_(self.wo.weight)
 
         self.qk_norm_eps = 1e-6
+        self.chunk_size = 256  # sliding window attention chunk size
 
-    def forward(self, x: torch.Tensor, seq_start: int, attn_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, seq_start: int, window: int) -> torch.Tensor:
         # x: (B, T, D)
         B, T, D = x.shape
         device = x.device
@@ -174,31 +175,41 @@ class MultiheadGQA(nn.Module):
         # RoPE (partial)
         q, k = apply_rope(q, k, rope_fraction=self.rope_fraction, base=self.rope_base, seq_start=seq_start)
 
-        # Keep 4D (B, H, T, Dh) to allow fused SDPA kernels when possible
-
-        # Scaled dot-product attention with additive mask; prefer Flash/mem-efficient kernels
-        # Note: we supply scale via the 'scale' kwarg; torch will still internally use 1/sqrt(d) unless scale is provided.
+        # Chunked sliding-window attention without additive masks
+        y_full = torch.empty_like(q)
+        cs = self.chunk_size
+        used_fused = False
         try:
-            # Prefer new sdpa_kernel context (PyTorch >= 2.4)
             with torch.nn.attention.sdpa_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.attn_scale
-                )
+                for start in range(0, T, cs):
+                    end = min(start + cs, T)
+                    k_start = max(0, start - (window - 1))
+                    k_end = end
+                    q_chunk = q[:, :, start:end, :]
+                    k_slice = k[:, :, k_start:k_end, :]
+                    v_slice = v[:, :, k_start:k_end, :]
+                    y_chunk = F.scaled_dot_product_attention(
+                        q_chunk, k_slice, v_slice, attn_mask=None, is_causal=True, scale=self.attn_scale
+                    )
+                    y_full[:, :, start:end, :] = y_chunk
+                used_fused = True
         except Exception:
-            # Fallback if the provided mask or environment is unsupported by flash/mem-efficient backends
-            try:
-                with torch.nn.attention.sdpa_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
-                    y = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.attn_scale
+            used_fused = False
+        if not used_fused:
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                for start in range(0, T, cs):
+                    end = min(start + cs, T)
+                    k_start = max(0, start - (window - 1))
+                    k_end = end
+                    q_chunk = q[:, :, start:end, :]
+                    k_slice = k[:, :, k_start:k_end, :]
+                    v_slice = v[:, :, k_start:k_end, :]
+                    y_chunk = F.scaled_dot_product_attention(
+                        q_chunk, k_slice, v_slice, attn_mask=None, is_causal=True, scale=self.attn_scale
                     )
-            except Exception:
-                # Ultimate fallback for older PyTorch
-                with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
-                    y = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.attn_scale
-                    )
-        # y is (B, H, T, Dh)
-        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, self.h * self.dh)
+                    y_full[:, :, start:end, :] = y_chunk
+        # y_full is (B, H, T, Dh)
+        y = y_full.permute(0, 2, 1, 3).contiguous().view(B, T, self.h * self.dh)
         return self.wo(y)
 
 
@@ -214,8 +225,8 @@ class Block(nn.Module):
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, d_ff)
 
-    def forward(self, x: torch.Tensor, seq_start: int, attn_mask: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), seq_start=seq_start, attn_mask=attn_mask)
+    def forward(self, x: torch.Tensor, seq_start: int, window: int) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), seq_start=seq_start, window=window)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -286,8 +297,7 @@ class GPT(nn.Module):
         device = x.device
         for li, block in enumerate(self.blocks):
             window = int(self._layer_windows[li].item())
-            attn_mask = self._band_mask(T, window, device)
-            x = block(x, seq_start=seq_start, attn_mask=attn_mask)
+            x = block(x, seq_start=seq_start, window=window)
         x = self.out_norm(x)
 
         if self.lm_head is not None:
@@ -522,8 +532,8 @@ def train(cfg: TrainCfg, mcfg: ModelCfg):
             }
             if cfg.use_wandb:
                 wandb.log(log, step=step + 1)
-            else:
-                print(log)
+            # Always print to stdout as well for SSH visibility
+            print(log)
 
         # Eval
         if cfg.eval_every > 0 and (step + 1) % cfg.eval_every == 0:
@@ -546,8 +556,8 @@ def train(cfg: TrainCfg, mcfg: ModelCfg):
             val_loss = sum(losses) / len(losses)
             if cfg.use_wandb:
                 wandb.log({'loss/val': val_loss}, step=step + 1)
-            else:
-                print({'step': step + 1, 'loss/val': val_loss})
+            # Always print val logs to stdout
+            print({'step': step + 1, 'loss/val': val_loss})
             model.train()
 
         # Save
