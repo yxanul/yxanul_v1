@@ -136,6 +136,7 @@ class MultiheadGQA(nn.Module):
         rope_fraction: float = 0.5,
         rope_base: float = 10000.0,
         attn_scale: float = 0.12,
+        chunk_size: int = 256,
     ):
         super().__init__()
         assert num_heads % num_kv == 0, "num_heads must be divisible by num_kv for GQA"
@@ -156,7 +157,7 @@ class MultiheadGQA(nn.Module):
         nn.init.zeros_(self.wo.weight)
 
         self.qk_norm_eps = 1e-6
-        self.chunk_size = 256  # sliding window attention chunk size
+        self.chunk_size = chunk_size  # sliding window attention chunk size
 
     def forward(self, x: torch.Tensor, seq_start: int, window: int) -> torch.Tensor:
         # x: (B, T, D)
@@ -222,10 +223,10 @@ class MultiheadGQA(nn.Module):
 # -------------------------------
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv: int, head_dim: int, d_ff: int,
-                 rope_fraction: float, rope_base: float, attn_scale: float):
+                 rope_fraction: float, rope_base: float, attn_scale: float, attn_chunk: int):
         super().__init__()
         self.norm1 = RMSNorm(dim)
-        self.attn = MultiheadGQA(dim, num_heads, num_kv, head_dim, rope_fraction, rope_base, attn_scale)
+        self.attn = MultiheadGQA(dim, num_heads, num_kv, head_dim, rope_fraction, rope_base, attn_scale, chunk_size=attn_chunk)
         self.norm2 = RMSNorm(dim)
         self.mlp = SwiGLU(dim, d_ff)
 
@@ -242,7 +243,8 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, dim: int = 640, n_layers: int = 48,
                  num_heads: int = 8, num_kv: int = 2, head_dim: int = 80,
                  d_ff: int = 1728, rope_fraction: float = 0.5, rope_base: float = 10000.0,
-                 attn_scale: float = 0.12, softcap: float = 20.0, untied_head: bool = True):
+                 attn_scale: float = 0.12, softcap: float = 20.0, untied_head: bool = True,
+                 attn_chunk: int = 256):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -253,7 +255,7 @@ class GPT(nn.Module):
         self.embed = nn.Embedding(vocab_size, dim)
         self.in_norm = RMSNorm(dim)
         self.blocks = nn.ModuleList([
-            Block(dim, num_heads, num_kv, head_dim, d_ff, rope_fraction, rope_base, attn_scale) for _ in range(n_layers)
+            Block(dim, num_heads, num_kv, head_dim, d_ff, rope_fraction, rope_base, attn_scale, attn_chunk) for _ in range(n_layers)
         ])
         self.out_norm = RMSNorm(dim)
         if untied_head:
@@ -401,13 +403,16 @@ class TrainCfg:
     device: str = 'cuda'
     compile: bool = True
     use_wandb: bool = True
-    wandb_project: str = 'optionA-270M' 
+    wandb_project: str = 'optionA-270M'
     wandb_run_name: Optional[str] = None
     # dataloader workers
     train_workers: int = 4
     val_workers: int = 2
     # timing instrumentation
     timing: bool = False
+    # window control
+    fixed_window: int = 0  # if >0, use this window for all layers
+    full_attn: bool = False  # if True, ignore schedule and use full causal attention (window = seq_len)
 
 
 @dataclass
@@ -423,6 +428,7 @@ class ModelCfg:
     attn_scale: float = 0.12
     softcap: float = 20.0
     untied_head: bool = True
+    attn_chunk: int = 256
 
 
 def cosine_lr(step: int, warmup: int, total: int, base_lr: float, min_mult: float) -> float:
@@ -475,6 +481,7 @@ def train(cfg: TrainCfg, mcfg: ModelCfg):
         attn_scale=mcfg.attn_scale,
         softcap=mcfg.softcap,
         untied_head=mcfg.untied_head,
+        attn_chunk=mcfg.attn_chunk,
     ).to(cfg.device)
 
     # Compile (PyTorch 2.0+ betterments)
@@ -503,8 +510,14 @@ def train(cfg: TrainCfg, mcfg: ModelCfg):
         lr = cosine_lr(step, cfg.warmup_steps, cfg.global_steps, cfg.lr, cfg.min_lr_mult)
         for pg in opt.param_groups:
             pg['lr'] = lr
-        short_w, long_w = window_schedule(step, cfg.warmup_steps)
-        wins = layer_windows(mcfg.n_layers, short_w, long_w)
+        if cfg.full_attn:
+            fixed_w = cfg.seq_len
+            wins = [fixed_w] * mcfg.n_layers
+        elif cfg.fixed_window and cfg.fixed_window > 0:
+            wins = [int(cfg.fixed_window)] * mcfg.n_layers
+        else:
+            short_w, long_w = window_schedule(step, cfg.warmup_steps)
+            wins = layer_windows(mcfg.n_layers, short_w, long_w)
         model.set_layer_windows(wins)
 
         # Batch
@@ -635,6 +648,9 @@ def main():
     parser.add_argument('--train_workers', type=int, default=4)
     parser.add_argument('--val_workers', type=int, default=2)
     parser.add_argument('--timing', action='store_true')
+    parser.add_argument('--fixed_window', type=int, default=0, help='If >0, use fixed local window across all layers')
+    parser.add_argument('--full_attn', action='store_true', help='Use full causal attention (window = seq_len)')
+    parser.add_argument('--attn_chunk', type=int, default=256, help='Attention chunk size for sliding-window SDPA')
     args = parser.parse_args()
 
     cfg = TrainCfg(
@@ -653,9 +669,11 @@ def main():
         train_workers=args.train_workers,
         val_workers=args.val_workers,
         timing=args.timing,
+        fixed_window=args.fixed_window,
+        full_attn=args.full_attn,
     )
 
-    mcfg = ModelCfg()
+    mcfg = ModelCfg(attn_chunk=args.attn_chunk)
 
     train(cfg, mcfg)
 
