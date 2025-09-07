@@ -179,19 +179,9 @@ class MultiheadGQA(nn.Module):
         k = k.reshape(B * self.h, T, self.dh)
         v = v.reshape(B * self.h, T, self.dh)
 
-        # Scaled dot-product attention with additive mask; prefer Flash/mem-efficient kernels
+        # Scaled dot-product attention with additive mask; use bf16 autocast outside
         # Note: we supply scale via the 'scale' kwarg; torch will still internally use 1/sqrt(d) unless scale is provided.
-        try:
-            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.attn_scale
-                )
-        except Exception:
-            # Fallback if the provided mask or environment is unsupported by flash/mem-efficient backends
-            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
-                y = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.attn_scale
-                )
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False, scale=self.attn_scale)
         y = y.view(B, self.h, T, self.dh).permute(0, 2, 1, 3).contiguous().view(B, T, self.h * self.dh)
         return self.wo(y)
 
