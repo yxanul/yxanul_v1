@@ -33,12 +33,6 @@ import transformer_engine.pytorch as te
 # Import our robust wandb logger
 from wandb_logger import WandBLogger
 
-# Optional SophiaG optimizer
-try:
-    from sophia import SophiaG
-    SOPHIA_AVAILABLE = True
-except Exception:
-    SOPHIA_AVAILABLE = False
 
 @dataclass
 class TrainingConfig:
@@ -246,13 +240,6 @@ def train():
     parser.add_argument('--n_embd', type=int, help='Embedding dimension (must be divisible by n_head)')
     parser.add_argument('--block_size', type=int, help='Context length')
     parser.add_argument('--dropout', type=float, help='Dropout probability')
-    # Optimizer choice and SophiaG hyperparams
-    parser.add_argument('--opt', type=str, default='adamw', choices=['adamw', 'sophia'], help='Optimizer to use')
-    parser.add_argument('--sophia_lr', type=float, default=6e-4, help='SophiaG learning rate')
-    parser.add_argument('--sophia_betas', type=float, nargs=2, default=(0.965, 0.99), help='SophiaG betas')
-    parser.add_argument('--sophia_rho', type=float, default=0.05, help='SophiaG rho')
-    parser.add_argument('--sophia_weight_decay', type=float, default=0.2, help='SophiaG weight decay')
-    parser.add_argument('--sophia_k', type=int, default=10, help='SophiaG Hessian EMA update frequency (iterations)')
     # Removed --no_caching as it's not implemented in CLEAN version
     args = parser.parse_args()
     
@@ -314,25 +301,14 @@ def train():
     # Get FP8 recipe
     fp8_recipe = get_fp8_recipe(model_config)
     
-    # Optimizer
-    if args.opt == 'sophia':
-        if not SOPHIA_AVAILABLE:
-            raise RuntimeError("SophiaG optimizer not available. Please `pip install sophia-optimizer` and ensure `from sophia import SophiaG`.")
-        optimizer = SophiaG(
-            model.parameters(),
-            lr=float(args.sophia_lr),
-            betas=tuple(args.sophia_betas),
-            rho=float(args.sophia_rho),
-            weight_decay=float(args.sophia_weight_decay),
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2),
-            weight_decay=config.weight_decay,
-            fused=True
-        )
+    # Optimizer - always use standard setup
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        betas=(config.beta1, config.beta2),
+        weight_decay=config.weight_decay,
+        fused=True
+    )
     
     # Data loader
     data_loader = DataLoader(config.data_dir, config.block_size, config.device)
@@ -361,9 +337,6 @@ def train():
     print(f"  - Gradient fusion: DISABLED (overhead)")
     print(f"  - Weight caching: NOT IMPLEMENTED (overhead > benefit)")
     print(f"  - Expected: 196k tokens/sec on RTX 5090")
-    print(f"Optimizer: {'SophiaG' if args.opt=='sophia' else 'AdamW'}")
-    if args.opt == 'sophia':
-        print(f"  SophiaG lr={args.sophia_lr}, betas={tuple(args.sophia_betas)}, rho={args.sophia_rho}, wd={args.sophia_weight_decay}, k={args.sophia_k}")
     print(f"Batch size: {config.batch_size}")
     print(f"Gradient accumulation: {config.gradient_accumulation_steps}")
     print(f"Effective batch size: {config.batch_size * config.gradient_accumulation_steps}")
@@ -375,9 +348,6 @@ def train():
     t0 = time.time()
     tokens_processed = 0
     
-    # Effective batch in tokens for SophiaG scaling
-    sophia_bs_tokens = config.batch_size * config.block_size * config.gradient_accumulation_steps
-
     for iter_num in range(config.max_iters):
         # Learning rate
         lr = get_lr(iter_num, config)
@@ -415,28 +385,8 @@ def train():
         else:
             grad_norm = torch.tensor(0.0)
         
-        # Optimizer step
-        if args.opt == 'sophia':
-            optimizer.step(bs=sophia_bs_tokens)
-        else:
-            optimizer.step()
-
-        # SophiaG Hessian EMA update every k iterations
-        if args.opt == 'sophia' and (iter_num + 1) % int(args.sophia_k) == 0:
-            optimizer.zero_grad(set_to_none=True)
-            use_fp8_now = config.use_fp8 and (iter_num >= config.fp8_warmup_steps)
-            if use_fp8_now:
-                with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-                    logits, _ = model(x, None)
-            else:
-                logits, _ = model(x, None)
-            samp_dist = torch.distributions.Categorical(logits=logits)
-            y_sample = samp_dist.sample()
-            loss_sampled = F.cross_entropy(logits.view(-1, logits.size(-1)), y_sample.view(-1), ignore_index=-1)
-            loss_sampled.backward()
-            optimizer.update_hessian()
-            optimizer.zero_grad(set_to_none=True)
-            model.zero_grad(set_to_none=True)
+        # Optimizer step - simple and clean
+        optimizer.step()
         
         # Update token count
         tokens_processed += config.batch_size * config.block_size * config.gradient_accumulation_steps
