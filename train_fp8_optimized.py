@@ -62,7 +62,7 @@ class TrainingConfig:
     
     # Training config
     batch_size: int = 8
-    gradient_accumulation_steps: int = 18
+    gradient_accumulation_steps: int = 22
     max_iters: int = 2000
     eval_interval: int = 100
     eval_iters: int = 50
