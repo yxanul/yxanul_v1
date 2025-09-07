@@ -82,16 +82,66 @@ class TrainingConfig:
 
 
 class DataLoader:
-    """Memory-mapped data loader."""
+    """Memory-mapped data loader.
+
+    Accepts either a directory containing 'train.bin' and optionally 'val.bin',
+    or a direct path to a single 'train.bin'. If only a train.bin is present,
+    creates 'val.bin' as the last 1% of tokens and uses the first 99% for training
+    without rewriting the original train.bin.
+    """
     def __init__(self, data_dir, block_size, device='cuda'):
         self.block_size = block_size
         self.device = device
-        
+
         data_path = Path(data_dir)
-        self.train_data = np.memmap(data_path / 'train.bin', dtype=np.uint16, mode='r')
-        self.val_data = np.memmap(data_path / 'val.bin', dtype=np.uint16, mode='r')
-        
-        print(f"Loaded data from {data_dir}")
+        if data_path.is_file() and data_path.suffix == '.bin':
+            # Single file path provided
+            train_path = data_path
+            base_dir = data_path.parent
+            val_path = base_dir / 'val.bin'
+            # Map the full train file
+            mm = np.memmap(train_path, dtype=np.uint16, mode='r')
+            n = mm.shape[0]
+            cut = max(int(n * 0.99), self.block_size + 1)  # ensure at least one window remains
+            cut = min(cut, n - (self.block_size + 1))      # and room for val
+
+            if not val_path.exists():
+                print(f"val.bin not found next to {train_path}. Creating 1% validation split at {val_path} ...")
+                val_view = mm[cut:]
+                with open(val_path, 'wb') as f:
+                    # Write as-is (uint16)
+                    val_view.tofile(f)
+                print(f"Wrote val.bin with {len(val_view):,} tokens")
+            # Training uses 0..cut slice; if val exists, respect its size
+            val_mm = np.memmap(val_path, dtype=np.uint16, mode='r')
+            cut = max(n - len(val_mm), self.block_size + 1)
+            self.train_data = mm[:cut]
+            self.val_data = val_mm
+            print(f"Loaded data from {base_dir}")
+        else:
+            # Directory path
+            train_path = data_path / 'train.bin'
+            val_path = data_path / 'val.bin'
+            assert train_path.exists(), f"Missing {train_path}"
+            mm = np.memmap(train_path, dtype=np.uint16, mode='r')
+            n = mm.shape[0]
+            if not val_path.exists():
+                cut = max(int(n * 0.99), self.block_size + 1)
+                cut = min(cut, n - (self.block_size + 1))
+                print(f"{val_path} not found. Creating 1% validation split ...")
+                val_view = mm[cut:]
+                with open(val_path, 'wb') as f:
+                    val_view.tofile(f)
+                print(f"Wrote val.bin with {len(val_view):,} tokens")
+                self.train_data = mm[:cut]
+            else:
+                # If val exists, respect its size and avoid leakage: assume last len(val) tokens are validation
+                val_mm = np.memmap(val_path, dtype=np.uint16, mode='r')
+                cut = max(n - len(val_mm), self.block_size + 1)
+                self.train_data = mm[:cut]
+                self.val_data = val_mm
+            print(f"Loaded data from {data_dir}")
+
         print(f"  Train: {len(self.train_data):,} tokens")
         print(f"  Val: {len(self.val_data):,} tokens")
     
@@ -171,7 +221,7 @@ def train():
     """Main training loop with optimizations."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch_size', type=int, help='Batch size')
-    parser.add_argument('--data_dir', type=str, default='data_mixed_3b', help='Data directory')
+    parser.add_argument('--data_dir', type=str, default='data_mixed_3b', help='Data directory or path to train.bin')
     parser.add_argument('--max_iters', type=int, default=2000, help='Max iterations')
     parser.add_argument('--eval_interval', type=int, default=200, help='Eval interval')
     parser.add_argument('--log_interval', type=int, default=10, help='Log interval')
