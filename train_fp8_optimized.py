@@ -457,8 +457,8 @@ def train():
             except:
                 perplexity = float('inf')
             
-            # Log comprehensive metrics
-            logger.log_metrics({
+            # Log comprehensive metrics (+ SophiaG win_rate if available)
+            metrics = {
                 'train/loss': avg_loss,
                 'train/perplexity': perplexity,
                 'train/lr': lr,
@@ -467,7 +467,27 @@ def train():
                 'train/fp8_active': use_fp8_now,
                 'train/gpu_memory_gb': torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
                 'train/iteration': iter_num,
-            }, step=iter_num)
+            }
+            if args.opt == 'sophia':
+                # Compute win_rate as in Sophia: num_effective / num_param
+                try:
+                    num_param = 0
+                    num_effective = 0
+                    rho = float(args.sophia_rho)
+                    for st in optimizer.state.values():
+                        if isinstance(st, dict) and ('exp_avg' in st) and ('hessian' in st):
+                            m = st['exp_avg']
+                            h = st['hessian']
+                            if isinstance(m, torch.Tensor) and isinstance(h, torch.Tensor):
+                                num_param += m.numel()
+                                thresh = rho * sophia_bs_tokens * h
+                                num_effective += (m.abs() < thresh).sum().item()
+                    if num_param > 0:
+                        metrics['train/win_rate'] = float(num_effective) / float(num_param)
+                    metrics['train/sophia_bs_tokens'] = float(sophia_bs_tokens)
+                except Exception:
+                    pass
+            logger.log_metrics(metrics, step=iter_num)
             
             tokens_processed = 0
             t0 = time.time()

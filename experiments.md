@@ -284,3 +284,70 @@ Saving checkpoint to checkpoints_fp8_optimized/best_model_fp8_optimized.pt
 iter 410: loss 3.6963, lr 8.00e-04, 121.2k tok/s, FP8: True
 iter 420: loss 3.6641, lr 8.00e-04, 136.3k tok/s, FP8: True
 iter 430: loss 3.6611, lr 8.00e-04, 136.6k tok/s, FP8: True
+
+
+
+
+TEST 5 SOPHIA G ! ! 
+python train_fp8_optimized.py --data_dir /workspace/yxanul_v1/mixed_6b/train.bin --vocab_size 32768 --n_layer 38 --n_head 8 --n_kv_heads 2 --n_embd 512 --opt sophia --sophia_lr 6e-4 --sophia_betas 0.965 0.99 --sophia_rho 0.05 --sophia_weight_decay 0.2 --sophia_k 10 --seed 1337
+
+
+
+iter 0: loss 10.5000, lr 0.00e+00, 113.2k tok/s, FP8: False
+Step 0: val loss 10.4550
+Saving checkpoint to checkpoints_fp8_optimized/best_model_fp8_optimized.pt
+iter 10: loss 9.5547, lr 4.00e-05, 108.5k tok/s, FP8: False
+iter 20: loss 9.1641, lr 8.00e-05, 119.3k tok/s, FP8: False
+iter 30: loss 8.6289, lr 1.20e-04, 119.0k tok/s, FP8: False
+iter 40: loss 8.0508, lr 1.60e-04, 118.9k tok/s, FP8: False
+iter 50: loss 7.4863, lr 2.00e-04, 119.0k tok/s, FP8: False
+iter 60: loss 7.2188, lr 2.40e-04, 119.0k tok/s, FP8: False
+iter 70: loss 7.1074, lr 2.80e-04, 118.9k tok/s, FP8: False
+iter 80: loss 7.0586, lr 3.20e-04, 118.8k tok/s, FP8: False
+iter 90: loss 6.9688, lr 3.60e-04, 118.7k tok/s, FP8: False
+iter 100: loss 6.7012, lr 4.00e-04, 119.7k tok/s, FP8: True
+iter 110: loss 6.6699, lr 4.40e-04, 134.4k tok/s, FP8: True
+iter 120: loss 6.5938, lr 4.80e-04, 135.6k tok/s, FP8: True
+iter 130: loss 6.5117, lr 5.20e-04, 134.1k tok/s, FP8: True
+iter 140: loss 6.4160, lr 5.60e-04, 135.2k tok/s, FP8: True
+iter 150: loss 6.2461, lr 6.00e-04, 134.7k tok/s, FP8: True
+iter 160: loss 6.2773, lr 6.40e-04, 134.7k tok/s, FP8: True
+iter 170: loss 6.0703, lr 6.80e-04, 135.4k tok/s, FP8: True
+iter 180: loss 6.0352, lr 7.20e-04, 135.3k tok/s, FP8: True
+iter 190: loss 5.9570, lr 7.60e-04, 135.1k tok/s, FP8: True
+iter 200: loss 5.9590, lr 8.00e-04, 135.6k tok/s, FP8: True
+Step 200: val loss 5.1387
+Saving checkpoint to checkpoints_fp8_optimized/best_model_fp8_optimized.pt
+iter 210: loss 5.8535, lr 8.00e-04, 120.4k tok/s, FP8: True
+iter 220: loss 5.7480, lr 8.00e-04, 135.6k tok/s, FP8: True
+iter 230: loss 5.7305, lr 8.00e-04, 134.8k tok/s, FP8: True
+iter 240: loss 5.6641, lr 8.00e-04, 135.5k tok/s, FP8: True
+iter 250: loss 5.6680, lr 8.00e-04, 134.7k tok/s, FP8: True
+iter 260: loss 5.6113, lr 8.00e-04, 135.4k tok/s, FP8: True
+iter 270: loss 5.5156, lr 8.00e-04, 135.7k tok/s, FP8: True
+iter 280: loss 5.4043, lr 8.00e-04, 134.8k tok/s, FP8: True
+iter 290: loss 5.4082, lr 8.00e-04, 134.9k tok/s, FP8: True
+iter 300: loss 5.4258, lr 8.00e-04, 135.2k tok/s, FP8: True
+iter 310: loss 5.2637, lr 8.00e-04, 135.3k tok/s, FP8: True
+iter 320: loss 5.3164, lr 8.00e-04, 135.3k tok/s, FP8: True
+iter 330: loss 5.2344, lr 8.00e-04, 134.9k tok/s, FP8: True
+iter 340: loss 5.1719, lr 8.00e-04, 134.9k tok/s, FP8: True
+iter 350: loss 5.1426, lr 8.00e-04, 135.4k tok/s, FP8: True
+iter 360: loss 5.1875, lr 8.00e-04, 135.2k tok/s, FP8: True
+iter 370: loss 5.1855, lr 8.00e-04, 134.8k tok/s, FP8: True
+iter 380: loss 5.1504, lr 8.00e-04, 135.2k tok/s, FP8: True
+iter 390: loss 5.1270, lr 8.00e-04, 135.1k tok/s, FP8: True
+iter 400: loss 5.1855, lr 8.00e-04, 135.6k tok/s, FP8: True
+Step 400: val loss 4.2888
+Saving checkpoint to checkpoints_fp8_optimized/best_model_fp8_optimized.pt
+iter 410: loss 5.0547, lr 8.00e-04, 120.8k tok/s, FP8: True
+iter 420: loss 5.0215, lr 8.00e-04, 135.5k tok/s, FP8: True
+iter 430: loss 5.0449, lr 8.00e-04, 135.5k tok/s, FP8: True
+iter 440: loss 5.0684, lr 8.00e-04, 135.2k tok/s, FP8: True
+iter 450: loss 4.9863, lr 8.00e-04, 135.9k tok/s, FP8: True
+iter 460: loss 4.9473, lr 8.00e-04, 134.8k tok/s, FP8: True
+iter 470: loss 5.0215, lr 8.00e-04, 135.7k tok/s, FP8: True
+iter 480: loss 4.9863, lr 8.00e-04, 135.4k tok/s, FP8: True
+iter 490: loss 4.9824, lr 8.00e-04, 135.7k tok/s, FP8: True
+iter 500: loss 5.0117, lr 8.00e-04, 135.7k tok/s, FP8: True
+Saving checkpoint to checkpoints_fp8_optimized/checkpoint_500_fp8_optimized.pt
