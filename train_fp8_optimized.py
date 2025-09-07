@@ -35,14 +35,14 @@ from wandb_logger import WandBLogger
 
 @dataclass
 class TrainingConfig:
-    # Model config
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    vocab_size: int = 49152
-    n_kv_heads: int = 3
+    # Model config (deep & narrow ~270M by default)
+    n_layer: int = 48
+    n_head: int = 8
+    n_embd: int = 640
+    vocab_size: int = 32768
+    n_kv_heads: int = 2
     block_size: int = 2048
-    dropout: float = 0.05
+    dropout: float = 0.0
     
     # FP8 config
     use_fp8: bool = True
@@ -228,6 +228,14 @@ def train():
     parser.add_argument('--no_fp8', action='store_true', help='Disable FP8')
     parser.add_argument('--no_fusion', action='store_true', help='Disable gradient fusion (always disabled in CLEAN)')
     parser.add_argument('--no_wandb', action='store_true', help='Disable Weights & Biases logging')
+    # Model overrides
+    parser.add_argument('--vocab_size', type=int, help='Tokenizer vocab size (e.g., 32768)')
+    parser.add_argument('--n_layer', type=int, help='Number of layers')
+    parser.add_argument('--n_head', type=int, help='Number of attention heads')
+    parser.add_argument('--n_kv_heads', type=int, help='Number of KV heads (GQA)')
+    parser.add_argument('--n_embd', type=int, help='Embedding dimension (must be divisible by n_head)')
+    parser.add_argument('--block_size', type=int, help='Context length')
+    parser.add_argument('--dropout', type=float, help='Dropout probability')
     # Removed --no_caching as it's not implemented in CLEAN version
     args = parser.parse_args()
     
@@ -237,6 +245,21 @@ def train():
         config.batch_size = args.batch_size
     if args.no_fp8:
         config.use_fp8 = False
+    # Model overrides
+    if args.vocab_size:
+        config.vocab_size = args.vocab_size
+    if args.n_layer:
+        config.n_layer = args.n_layer
+    if args.n_head:
+        config.n_head = args.n_head
+    if args.n_kv_heads:
+        config.n_kv_heads = args.n_kv_heads
+    if args.n_embd:
+        config.n_embd = args.n_embd
+    if args.block_size:
+        config.block_size = args.block_size
+    if args.dropout is not None:
+        config.dropout = args.dropout
     # Gradient fusion always disabled in CLEAN version
     config.fuse_wgrad_accumulation = False
     config.cache_fp8_weights = False
