@@ -33,6 +33,14 @@ except ImportError:
     import sys
     sys.exit(1)
 
+# Enable TF32 for faster fp32 GEMMs on Ampere+/Hopper
+if torch.cuda.is_available():
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+
 @dataclass
 class AttnSpec:
     """Per-layer attention configuration."""
@@ -186,15 +194,14 @@ def _local_sliding_attention(
         k_win = k_win_flat.view(B, H, L, w, D)                                    # [B,H,L,w,D]
         v_win = v_win_flat.view(B, H, L, w, D)                                    # [B,H,L,w,D]
 
-        # Compute in fp32 for stability
-        q_chunk = q[:, :, s:e, :].unsqueeze(3)  # [B,H,L,1,D]
-        qf = q_chunk.to(torch.float32)
-        kf = k_win.to(torch.float32)
-        scores = (qf * kf).sum(dim=-1) / math.sqrt(D)            # [B,H,L,w], fp32
+        # Compute scores using batched GEMM in fp32 for stability
+        qL = q[:, :, s:e, :]                                      # [B,H,L,D]
+        q2 = qL.reshape(B * H * L, 1, D).to(torch.float32)        # [BHL,1,D]
+        k2 = k_win.reshape(B * H * L, w, D).transpose(1, 2).contiguous().to(torch.float32)  # [BHL,D,w]
+        scores = torch.bmm(q2, k2).view(B, H, L, w) / math.sqrt(D)  # [B,H,L,w]
 
-        # Mask out invalid (negative) positions to avoid overweighting token 0
-        if invalid.any():
-            scores = scores.masked_fill(invalid.view(1, 1, L, w), float('-inf'))
+        # Mask out invalid (negative) positions without GPU sync
+        scores = scores.masked_fill(invalid.view(1, 1, L, w), float('-inf'))
 
         # numerically stable softmax
         scores = scores - scores.amax(dim=-1, keepdim=True)
@@ -202,8 +209,10 @@ def _local_sliding_attention(
         if training and dropout_p > 0.0:
             attn = F.dropout(attn, p=dropout_p)
 
-        # Weighted sum of V over window (accumulate in fp32, cast back)
-        out_chunk = (attn.unsqueeze(-1) * v_win.to(attn.dtype)).sum(dim=-2)  # [B,H,L,D], fp32
+        # Weighted sum of V over window via batched GEMM (fp32), then cast back
+        attn2 = attn.view(B * H * L, 1, w)                          # [BHL,1,w]
+        v2 = v_win.view(B * H * L, w, D).to(attn.dtype)             # [BHL,w,D]
+        out_chunk = torch.bmm(attn2, v2).view(B, H, L, D)           # [B,H,L,D]
         out[:, :, s:e, :] = out_chunk.to(out.dtype)
 
     return out
