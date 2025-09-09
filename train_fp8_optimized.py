@@ -261,6 +261,7 @@ def train():
     parser.add_argument('--attn_dilated_range', type=str, default='', help='Inclusive range start:end to apply dilation to windowed layers (e.g., "13:29")')
     parser.add_argument('--attn_dilation', type=int, default=2, help='Dilation factor for layers in --attn_dilated_range')
     parser.add_argument('--attn_local_chunk', type=int, default=128, help='Chunk size for local sliding attention to bound memory')
+    parser.add_argument('--no_attn_checkpoint', action='store_true', help='Disable gradient checkpointing for sliding attention')
     # Removed --no_caching as it's not implemented in CLEAN version
     args = parser.parse_args()
     
@@ -308,6 +309,11 @@ def train():
         fp8_amax_history_len=config.fp8_amax_history_len,
         fuse_wgrad_accumulation=False,  # Always disabled in CLEAN
     )
+    # Control checkpointing for sliding attention
+    try:
+        model_config.checkpoint_sliding = not bool(getattr(args, 'no_attn_checkpoint', False))
+    except Exception:
+        model_config.checkpoint_sliding = True
     
     # Wire attention/local windowing options
     try:

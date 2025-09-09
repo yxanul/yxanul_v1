@@ -21,6 +21,7 @@ import torch.nn.functional as F
 import math
 from dataclasses import dataclass
 from typing import Optional, List
+from torch.utils.checkpoint import checkpoint
 
 # TransformerEngine imports
 try:
@@ -90,6 +91,7 @@ class ModelConfig:
     attn_types: Optional[List[AttnSpec]] = None  # None => all global (back-compat)
     window_default: int = 256
     local_chunk_size: int = 128  # sequence chunk for local attention to bound memory
+    checkpoint_sliding: bool = True  # recompute sliding attention in backward to save memory
     
     def __post_init__(self):
         assert self.n_embd % self.n_head == 0
@@ -176,14 +178,13 @@ def _local_sliding_attention(
         idx = idx_raw.clamp_min(0).clamp_max(T - 1)
         idx_b = idx.view(1, 1, L, w).expand(B, H, L, w)          # [B,H,L,w]
 
-        # Gather K and V windows
-        # Note: torch.gather requires index to have the same number of dims as input.
-        # We insert a window dimension on k/v via expand so both become 5D and
-        # match the 5D index shape (B,H,L,w,D) when gathering along dim=2.
-        k_exp = k.unsqueeze(3).expand(B, H, T, w, D)  # [B,H,T,w,D]
-        v_exp = v.unsqueeze(3).expand(B, H, T, w, D)  # [B,H,T,w,D]
-        k_win = k_exp.gather(dim=2, index=idx_b.unsqueeze(-1).expand(B, H, L, w, D))  # [B,H,L,w,D]
-        v_win = v_exp.gather(dim=2, index=idx_b.unsqueeze(-1).expand(B, H, L, w, D))  # [B,H,L,w,D]
+        # Gather K and V windows without materializing a w dimension on inputs
+        # Flatten (L,w) to a single dim for gather, then reshape back.
+        idx_flat = idx_b.reshape(B, H, L * w)                                     # [B,H,L*w]
+        k_win_flat = k.gather(dim=2, index=idx_flat.unsqueeze(-1).expand(B, H, L * w, D))  # [B,H,L*w,D]
+        v_win_flat = v.gather(dim=2, index=idx_flat.unsqueeze(-1).expand(B, H, L * w, D))  # [B,H,L*w,D]
+        k_win = k_win_flat.view(B, H, L, w, D)                                    # [B,H,L,w,D]
+        v_win = v_win_flat.view(B, H, L, w, D)                                    # [B,H,L,w,D]
 
         # Compute in fp32 for stability
         q_chunk = q[:, :, s:e, :].unsqueeze(3)  # [B,H,L,1,D]
@@ -220,6 +221,7 @@ class CleanAttention(nn.Module):
         # Per-layer attention behavior; None => global (back-compat)
         self.attn_spec = attn_spec or AttnSpec(kind="global")
         self.local_chunk = getattr(config, "local_chunk_size", 128)
+        self.checkpoint_sliding = getattr(config, "checkpoint_sliding", True)
         
         # Always use separate projections (simpler and just as fast at this scale)
         self.q_proj = te.Linear(
@@ -353,7 +355,18 @@ class CleanBlock(nn.Module):
     
     def forward(self, x, rope_cache):
         # Clean forward pass - no is_first_microbatch threading
-        x = x + self.attn(self.ln_1(x), rope_cache)
+        resid = x
+        if (
+            isinstance(self.attn.attn_spec, AttnSpec)
+            and self.attn.attn_spec.kind != "global"
+            and self.training
+            and getattr(self.attn, "checkpoint_sliding", True)
+        ):
+            def _attn_path(inp):
+                return self.attn(self.ln_1(inp), rope_cache)
+            x = resid + checkpoint(_attn_path, x, use_reentrant=False)
+        else:
+            x = resid + self.attn(self.ln_1(x), rope_cache)
         x = x + self.ffn(self.ln_2(x))
         return x
 
