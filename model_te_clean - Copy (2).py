@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional
 
 # TransformerEngine imports
 try:
@@ -31,42 +31,6 @@ except ImportError:
     print("ERROR: TransformerEngine not available!")
     import sys
     sys.exit(1)
-
-@dataclass
-class AttnSpec:
-    """Per-layer attention configuration."""
-    kind: str                # 'global' | 'window'
-    window: int = 256        # sliding window size
-    dilation: int = 1        # 1 for normal, 2 for dilated (effective lookback = (window-1)*dilation+1)
-
-
-def make_attn_plan(
-    n_layer: int,
-    global_layers: List[int],
-    window: int = 256,
-    dilated_range: Optional[tuple] = None,
-    dilation: int = 2,
-) -> List[AttnSpec]:
-    """
-    Build an attention plan:
-      - layers in `global_layers` -> global attention
-      - layers in `dilated_range` (inclusive) -> window with `dilation`
-      - remaining layers -> plain window (dilation=1)
-    """
-    globals_set = set(global_layers)
-    plan: List[AttnSpec] = []
-    for i in range(n_layer):
-        if i in globals_set:
-            plan.append(AttnSpec(kind="global"))
-        elif dilated_range is not None and dilated_range[0] <= i <= dilated_range[1]:
-            if i in globals_set:
-                plan.append(AttnSpec(kind="global"))
-            else:
-                plan.append(AttnSpec(kind="window", window=window, dilation=dilation))
-        else:
-            plan.append(AttnSpec(kind="window", window=window, dilation=1))
-    return plan
-
 
 @dataclass
 class ModelConfig:
@@ -85,11 +49,6 @@ class ModelConfig:
     fp8_amax_compute_algo: str = "max"
     # Optimizations - kept for compatibility but simplified
     fuse_wgrad_accumulation: bool = False  # DISABLED - adds overhead
-    
-    # Sliding/global attention plan
-    attn_types: Optional[List[AttnSpec]] = None  # None => all global (back-compat)
-    window_default: int = 256
-    local_chunk_size: int = 128  # sequence chunk for local attention to bound memory
     
     def __post_init__(self):
         assert self.n_embd % self.n_head == 0
@@ -140,81 +99,15 @@ class RoPE:
         return x_rot.reshape(batch, seq_len, n_heads, head_dim)
 
 
-def _local_sliding_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    window: int,
-    dilation: int,
-    dropout_p: float,
-    training: bool,
-    chunk: int,
-) -> torch.Tensor:
-    """
-    Vectorized sliding-window attention with optional dilation.
-    - Masks out invalid negative indices instead of clamping-to-0 bias.
-    - Upcasts to fp32 for stability during softmax, then casts back.
-    Complexity: O(T * window). Memory bounded via seq chunking.
-    Shapes: q,k,v = [B, H, T, D] -> out [B, H, T, D]
-    """
-    B, H, T, D = q.shape
-    device = q.device
-    w = min(window, (T + dilation - 1) // dilation)
-    out = torch.empty_like(q)
-
-    # Precompute offsets once per call
-    offsets = (torch.arange(w, device=device) * dilation)  # [w]
-
-    for s in range(0, T, chunk):
-        e = min(T, s + chunk)
-        L = e - s
-        # For positions t in [s, e), build indices of last 'w' keys spaced by 'dilation'
-        t = torch.arange(s, e, device=device)
-        start = t - (w - 1) * dilation
-        idx_raw = start[:, None] + offsets[None, :]              # [L, w]
-        invalid = idx_raw < 0                                    # [L, w]
-        idx = idx_raw.clamp_min(0).clamp_max(T - 1)
-        idx_b = idx.view(1, 1, L, w).expand(B, H, L, w)          # [B,H,L,w]
-
-        # Gather K and V windows
-        k_win = k.gather(dim=2, index=idx_b.unsqueeze(-1).expand(B, H, L, w, D))  # [B,H,L,w,D]
-        v_win = v.gather(dim=2, index=idx_b.unsqueeze(-1).expand(B, H, L, w, D))  # [B,H,L,w,D]
-
-        # Compute in fp32 for stability
-        q_chunk = q[:, :, s:e, :].unsqueeze(3)  # [B,H,L,1,D]
-        qf = q_chunk.to(torch.float32)
-        kf = k_win.to(torch.float32)
-        scores = (qf * kf).sum(dim=-1) / math.sqrt(D)            # [B,H,L,w], fp32
-
-        # Mask out invalid (negative) positions to avoid overweighting token 0
-        if invalid.any():
-            scores = scores.masked_fill(invalid.view(1, 1, L, w), float('-inf'))
-
-        # numerically stable softmax
-        scores = scores - scores.amax(dim=-1, keepdim=True)
-        attn = scores.softmax(dim=-1)                            # [B,H,L,w], fp32
-        if training and dropout_p > 0.0:
-            attn = F.dropout(attn, p=dropout_p)
-
-        # Weighted sum of V over window (accumulate in fp32, cast back)
-        out_chunk = (attn.unsqueeze(-1) * v_win.to(attn.dtype)).sum(dim=-2)  # [B,H,L,D], fp32
-        out[:, :, s:e, :] = out_chunk.to(out.dtype)
-
-    return out
-
-
 class CleanAttention(nn.Module):
     """Multi-Head Attention with GQA - CLEAN implementation without dead code."""
     
-    def __init__(self, config, attn_spec: Optional[AttnSpec] = None):
+    def __init__(self, config):
         super().__init__()
         self.n_head = config.n_head
         self.n_kv_heads = config.n_kv_heads
         self.head_dim = config.head_dim
         self.n_embd = config.n_embd
-        # Per-layer attention behavior; None => global (back-compat)
-        self.attn_spec = attn_spec or AttnSpec(kind="global")
-        self.local_chunk = getattr(config, "local_chunk_size", 128)
         
         # Always use separate projections (simpler and just as fast at this scale)
         self.q_proj = te.Linear(
@@ -247,7 +140,6 @@ class CleanAttention(nn.Module):
     
     def forward(self, x, rope_cache):
         B, T, C = x.shape
-        spec = self.attn_spec
         
         # Simple separate projections - no is_first_microbatch nonsense
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
@@ -268,25 +160,13 @@ class CleanAttention(nn.Module):
             k = k.repeat_interleave(self.n_head // self.n_kv_heads, dim=1)
             v = v.repeat_interleave(self.n_head // self.n_kv_heads, dim=1)
         
-        if spec.kind == "global":
-            # Keep the fast path: SDPA causal
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=0.0 if not self.training else self.dropout_p,
-                is_causal=True
-            )
-        else:
-            # Sliding-window (optionally dilated) attention, O(T·w)
-            # q,k,v are [B,H,T,D]
-            y = _local_sliding_attention(
-                q, k, v,
-                window=spec.window,
-                dilation=spec.dilation,
-                dropout_p=(0.0 if not self.training else self.dropout_p),
-                training=self.training,
-                chunk=self.local_chunk,
-            )
+        # Standard SDPA (BF16 for RTX 5090 compatibility)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0.0 if not self.training else self.dropout_p,
+            is_causal=True
+        )
         
         # Reshape output
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -339,10 +219,10 @@ class CleanFeedForward(nn.Module):
 class CleanBlock(nn.Module):
     """Transformer block - CLEAN implementation."""
     
-    def __init__(self, config, attn_spec: Optional[AttnSpec] = None):
+    def __init__(self, config):
         super().__init__()
         self.ln_1 = te.RMSNorm(config.n_embd, eps=1e-6)
-        self.attn = CleanAttention(config, attn_spec=attn_spec)
+        self.attn = CleanAttention(config)
         self.ln_2 = te.RMSNorm(config.n_embd, eps=1e-6)
         self.ffn = CleanFeedForward(config)
     
@@ -374,18 +254,10 @@ class CleanGPT_TE(nn.Module):
         self.lm_head.weight = wte.weight  # Weight tying
         
         # Transformer blocks
-        # Build per-layer attention plan
-        if config.attn_types is None:
-            # Back-compat: if no plan provided -> all global
-            attn_plan = [AttnSpec(kind="global") for _ in range(config.n_layer)]
-        else:
-            assert len(config.attn_types) == config.n_layer, "attn_types length must equal n_layer"
-            attn_plan = config.attn_types
-
         self.transformer = nn.ModuleDict(dict(
             wte = wte,
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([CleanBlock(config, attn_spec=attn_plan[i]) for i in range(config.n_layer)]),
+            h = nn.ModuleList([CleanBlock(config) for _ in range(config.n_layer)]),
             ln_f = te.RMSNorm(config.n_embd, eps=1e-6),
         ))
         
@@ -413,10 +285,6 @@ class CleanGPT_TE(nn.Module):
         print(f"    - Gradient fusion: DISABLED (memory traffic overhead)")
         print(f"    - is_first_microbatch: REMOVED (dead code)")
         print(f"  Expected: 196k tokens/sec on RTX 5090")
-        kinds = [a.kind if isinstance(a, AttnSpec) else "?" for a in (config.attn_types or [])]
-        if kinds:
-            print(f"  Attention plan (per layer): {kinds}")
-            print(f"  Note: 'window' uses sliding attention with optional dilation.")
     
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, te.Linear)):

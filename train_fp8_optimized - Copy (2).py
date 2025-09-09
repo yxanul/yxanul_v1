@@ -25,14 +25,13 @@ from typing import Optional
 import argparse
 
 # Import CLEAN model (the actually fast one)
-from model_te_clean import ModelConfig, CleanGPT_TE, get_fp8_recipe, AttnSpec, make_attn_plan
+from model_te_clean import ModelConfig, CleanGPT_TE, get_fp8_recipe
 
 # TransformerEngine
 import transformer_engine.pytorch as te
 
 # Import our robust wandb logger
 from wandb_logger import WandBLogger
-from collections import defaultdict
 
 # Optional SophiaG optimizer
 try:
@@ -254,13 +253,6 @@ def train():
     parser.add_argument('--sophia_rho', type=float, default=0.05, help='SophiaG rho')
     parser.add_argument('--sophia_weight_decay', type=float, default=0.2, help='SophiaG weight decay')
     parser.add_argument('--sophia_k', type=int, default=10, help='SophiaG Hessian EMA update frequency (iterations)')
-    # Attention/windowing controls
-    parser.add_argument('--attn_windowed', action='store_true', help='Enable sliding-window attention plan')
-    parser.add_argument('--attn_window', type=int, default=256, help='Sliding window size for windowed layers')
-    parser.add_argument('--attn_global_layers', type=str, default='', help='Comma-separated layer indices to keep global attention (e.g., "6,12,18")')
-    parser.add_argument('--attn_dilated_range', type=str, default='', help='Inclusive range start:end to apply dilation to windowed layers (e.g., "13:29")')
-    parser.add_argument('--attn_dilation', type=int, default=2, help='Dilation factor for layers in --attn_dilated_range')
-    parser.add_argument('--attn_local_chunk', type=int, default=128, help='Chunk size for local sliding attention to bound memory')
     # Removed --no_caching as it's not implemented in CLEAN version
     args = parser.parse_args()
     
@@ -308,40 +300,6 @@ def train():
         fp8_amax_history_len=config.fp8_amax_history_len,
         fuse_wgrad_accumulation=False,  # Always disabled in CLEAN
     )
-    
-    # Wire attention/local windowing options
-    try:
-        model_config.local_chunk_size = int(getattr(args, 'attn_local_chunk', 128))
-    except Exception:
-        model_config.local_chunk_size = 128
-    if getattr(args, 'attn_windowed', False):
-        # Parse global layers
-        if args.attn_global_layers.strip():
-            try:
-                global_layers = [int(x) for x in args.attn_global_layers.split(',') if x.strip() != '']
-            except Exception:
-                global_layers = []
-        else:
-            global_layers = []
-        # Parse dilated range
-        dilated_range = None
-        if args.attn_dilated_range.strip():
-            try:
-                parts = args.attn_dilated_range.split(':')
-                if len(parts) == 2:
-                    a, b = int(parts[0]), int(parts[1])
-                    dilated_range = (min(a, b), max(a, b))
-            except Exception:
-                dilated_range = None
-        # Build plan and attach
-        plan = make_attn_plan(
-            n_layer=model_config.n_layer,
-            global_layers=global_layers,
-            window=int(args.attn_window),
-            dilated_range=dilated_range,
-            dilation=int(args.attn_dilation),
-        )
-        model_config.attn_types = plan
     
     # Set seeds for reproducibility (keeps fast kernels; not fully deterministic)
     torch.manual_seed(config.seed)
@@ -416,9 +374,6 @@ def train():
     best_val_loss = float('inf')
     t0 = time.time()
     tokens_processed = 0
-    # Clip-rate tracking
-    clip_hits = 0
-    total_steps = 0
     
     # Effective batch in tokens for SophiaG scaling
     sophia_bs_tokens = config.batch_size * config.block_size * config.gradient_accumulation_steps
@@ -459,14 +414,6 @@ def train():
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         else:
             grad_norm = torch.tensor(0.0)
-        # Update clip-rate counters
-        if config.grad_clip > 0:
-            try:
-                if float(grad_norm) > float(config.grad_clip):
-                    clip_hits += 1
-            except Exception:
-                pass
-        total_steps += 1
         
         # Optimizer step
         if args.opt == 'sophia':

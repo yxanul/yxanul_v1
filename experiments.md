@@ -351,3 +351,62 @@ iter 480: loss 4.9863, lr 8.00e-04, 135.4k tok/s, FP8: True
 iter 490: loss 4.9824, lr 8.00e-04, 135.7k tok/s, FP8: True
 iter 500: loss 5.0117, lr 8.00e-04, 135.7k tok/s, FP8: True
 Saving checkpoint to checkpoints_fp8_optimized/checkpoint_500_fp8_optimized.pt
+
+Here’s the math and concrete values for your current setup.
+
+Effective tokens/iter: batch_size × grad_accum × seq_len
+
+12 × 22 × 2048 = 540,672 tokens/iter
+For ~6.0B tokens total
+
+max_iters: ceil(6,000,000,000 / 540,672) ≈ 11,100
+lr_decay_iters: set equal to max_iters → 11,100
+With warmup_iters=2000, the schedule is:
+Plateau: 0.6 × 11,100 = 6,660 steps (at base LR)
+Decay: 11,100 − 2,000 − 6,660 = 2,440 steps (cosine to min_lr)
+For full train split (~6,184,775,876 tokens)
+
+max_iters: ceil(6,184,775,876 / 540,672) ≈ 11,440
+lr_decay_iters: 11,440
+Plateau: 0.6 × 11,440 = 6,864; Decay: 11,440 − 2,000 − 6,864 = 2,576
+Quick formula for any future change
+
+tokens_per_iter = B × accum × T
+max_iters = ceil(total_tokens / tokens_per_iter)
+lr_decay_iters = max_iters (to finish decay near the end)
+
+
+
+Vanishing risk:
+grad/first_block_rms < 1e-7 for many steps, ratio_last_first > 100.
+Loss not improving while global grad_norm is small and clip_rate ~0.
+Exploding risk:
+clip_rate > 0.2 sustained, frequent loss spikes, max_block_rms outliers orders of magnitude above median.
+update/weight ratios >> 1e-2 for many blocks (depends on LR and scale).
+Rules of thumb
+
+Vanishing: first_block_rms very small (e.g., <1e-7) while last_block_rms is much larger; ratio_last_first >> 1 for many steps.
+Exploding: frequent clipping (clip_rate > 0.2 sustained), spikes in max_block_rms, or large upd/max_block_ratio.
+
+lip rate
+
+Tracks fraction of steps where grad_norm > grad_clip.
+Logged as train/clip_rate.
+Per-layer gradient RMS (sampled)
+
+Computes RMS grad per parameter, aggregates to per-block (transformer.h.N.*).
+Logs every 100 steps:
+grad/first_block_rms, grad/last_block_rms, grad/ratio_last_first
+grad/min_block_rms, grad/median_block_rms, grad/max_block_rms
+Update/Weight ratio per block
+
+Right after optimizer.step(), computes RMS(update)/RMS(weight) per parameter and aggregates to per-block.
+Logs at every logging step:
+upd/first_block_ratio, upd/last_block_ratio, upd/ratio_last_first
+upd/min_block_ratio, upd/median_block_ratio, upd/max_block_ratio
+Stores previous parameter snapshot per tensor in p._prev_data.
+
+ python train_fp8_optimized.py --data_dir /workspace/yxanul_v1/mixed_6b/train.bin --vocab_size 32768 --n_layer 38 --n_head 8 --n_kv_heads 2 --n_embd 512 --opt sophia --sophia_lr 6e-4 --sophia_betas 0.965 0.99 --sophia_rho 0.05 --sophia_weight_decay 0.2 --sophia_k 10 --seed 1337 --batch_size 12 
+
+
+ATTN LAYERS : python train_fp8_optimized.py --data_dir /workspace/yxanul_v1/mixed_6b/train.bin --vocab_size 32768 --n_layer 38 --n_head 8 --n_kv_heads 2 --n_embd 512 --opt sophia --sophia_lr 6e-4 --sophia_betas 0.965 0.99 --sophia_rho 0.05 --sophia_weight_decay 0.2 --sophia_k 10 --seed 1337 --batch_size 12 --attn_windowed --attn_window 256 --attn_global_layers 6,12,18,24,30,37 --attn_dilated_range 13:29 --attn_dilation 2 --attn_local_chunk 128
