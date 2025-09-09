@@ -286,7 +286,21 @@ class CleanAttention(nn.Module):
         else:
             # Sliding-window (optionally dilated) attention, O(T·w)
             # q,k,v are [B,H,T,D]
-            y = _local_sliding_attention(
+            if self.training and self.checkpoint_sliding:
+                y = checkpoint(
+                    lambda q_, k_, v_: _local_sliding_attention(
+                        q_, k_, v_,
+                        window=spec.window,
+                        dilation=spec.dilation,
+                        dropout_p=(0.0 if not self.training else self.dropout_p),
+                        training=True,
+                        chunk=self.local_chunk,
+                    ),
+                    q, k, v,
+                    use_reentrant=False,
+                )
+            else:
+                y = _local_sliding_attention(
                 q, k, v,
                 window=spec.window,
                 dilation=spec.dilation,
