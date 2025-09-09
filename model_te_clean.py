@@ -33,6 +33,18 @@ except ImportError:
     import sys
     sys.exit(1)
 
+# Optional FlashAttention 2
+FA_AVAILABLE = False
+try:
+    try:
+        from flash_attn import flash_attn_func, flash_attn_qkvpacked_func  # type: ignore
+        FA_AVAILABLE = True
+    except Exception:
+        from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_qkvpacked_func  # type: ignore
+        FA_AVAILABLE = True
+except Exception:
+    FA_AVAILABLE = False
+
 # Enable TF32 for faster fp32 GEMMs on Ampere+/Hopper
 if torch.cuda.is_available():
     try:
@@ -231,6 +243,10 @@ class CleanAttention(nn.Module):
         self.attn_spec = attn_spec or AttnSpec(kind="global")
         self.local_chunk = getattr(config, "local_chunk_size", 128)
         self.checkpoint_sliding = getattr(config, "checkpoint_sliding", True)
+        # Use FlashAttention local path only for undilated window layers when available
+        self.use_fa_local = (
+            (self.attn_spec.kind == "window") and (getattr(self.attn_spec, "dilation", 1) == 1) and FA_AVAILABLE
+        )
         
         # Always use separate projections (simpler and just as fast at this scale)
         self.q_proj = te.Linear(
@@ -264,6 +280,33 @@ class CleanAttention(nn.Module):
     def forward(self, x, rope_cache):
         B, T, C = x.shape
         spec = self.attn_spec
+
+        # Fast path with FlashAttention 2 for global and undilated window
+        if FA_AVAILABLE and (spec.kind == "global" or (spec.kind == "window" and getattr(spec, "dilation", 1) == 1)):
+            # Projections on [B,T,H,D]
+            q_bt = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
+            k_bt = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
+            v_bt = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim)
+            # RoPE
+            q_bt = RoPE.apply_rotary_pos_emb(q_bt, rope_cache)
+            k_bt = RoPE.apply_rotary_pos_emb(k_bt, rope_cache)
+            # Window config
+            if spec.kind == "global":
+                window = (-1, -1)
+            else:
+                window = (int(spec.window) - 1, 0)
+            # Run FlashAttention
+            y_bt = flash_attn_func(
+                q_bt.contiguous(), k_bt.contiguous(), v_bt.contiguous(),
+                dropout_p=(0.0 if not self.training else self.dropout_p),
+                softmax_scale=None, causal=True,
+                window_size=window, alibi_slopes=None, deterministic=False,
+            )  # [B,T,H,D]
+            # Final projection
+            y = y_bt.contiguous().view(B, T, C)
+            y = self.o_proj(y)
+            y = self.dropout(y)
+            return y
         
         # Simple separate projections - no is_first_microbatch nonsense
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
@@ -384,6 +427,7 @@ class CleanBlock(nn.Module):
             and self.attn.attn_spec.kind != "global"
             and self.training
             and getattr(self.attn, "checkpoint_sliding", True)
+            and not getattr(self.attn, "use_fa_local", False)
         ):
             def _attn_path(inp):
                 return self.attn(self.ln_1(inp), rope_cache)
