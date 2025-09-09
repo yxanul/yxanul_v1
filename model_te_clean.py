@@ -177,8 +177,13 @@ def _local_sliding_attention(
         idx_b = idx.view(1, 1, L, w).expand(B, H, L, w)          # [B,H,L,w]
 
         # Gather K and V windows
-        k_win = k.gather(dim=2, index=idx_b.unsqueeze(-1).expand(B, H, L, w, D))  # [B,H,L,w,D]
-        v_win = v.gather(dim=2, index=idx_b.unsqueeze(-1).expand(B, H, L, w, D))  # [B,H,L,w,D]
+        # Note: torch.gather requires index to have the same number of dims as input.
+        # We insert a window dimension on k/v via expand so both become 5D and
+        # match the 5D index shape (B,H,L,w,D) when gathering along dim=2.
+        k_exp = k.unsqueeze(3).expand(B, H, T, w, D)  # [B,H,T,w,D]
+        v_exp = v.unsqueeze(3).expand(B, H, T, w, D)  # [B,H,T,w,D]
+        k_win = k_exp.gather(dim=2, index=idx_b.unsqueeze(-1).expand(B, H, L, w, D))  # [B,H,L,w,D]
+        v_win = v_exp.gather(dim=2, index=idx_b.unsqueeze(-1).expand(B, H, L, w, D))  # [B,H,L,w,D]
 
         # Compute in fp32 for stability
         q_chunk = q[:, :, s:e, :].unsqueeze(3)  # [B,H,L,1,D]
