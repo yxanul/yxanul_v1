@@ -25,13 +25,14 @@ from typing import Optional
 import argparse
 
 # Import CLEAN model (the actually fast one)
-from model_te_clean import ModelConfig, CleanGPT_TE, get_fp8_recipe
+from model_te_clean_global import ModelConfig, CleanGPT_TE, get_fp8_recipe
 
 # TransformerEngine
 import transformer_engine.pytorch as te
 
 # Import our robust wandb logger
 from wandb_logger import WandBLogger
+from collections import defaultdict
 
 # Optional SophiaG optimizer
 try:
@@ -374,6 +375,9 @@ def train():
     best_val_loss = float('inf')
     t0 = time.time()
     tokens_processed = 0
+    # Clip-rate tracking
+    clip_hits = 0
+    total_steps = 0
     
     # Effective batch in tokens for SophiaG scaling
     sophia_bs_tokens = config.batch_size * config.block_size * config.gradient_accumulation_steps
@@ -415,6 +419,15 @@ def train():
         else:
             grad_norm = torch.tensor(0.0)
         
+        # Update clip-rate counters
+        if config.grad_clip > 0:
+            try:
+                if float(grad_norm) > float(config.grad_clip):
+                    clip_hits += 1
+            except Exception:
+                pass
+        total_steps += 1
+
         # Optimizer step
         if args.opt == 'sophia':
             optimizer.step(bs=sophia_bs_tokens)
