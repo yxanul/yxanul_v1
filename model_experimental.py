@@ -82,6 +82,33 @@ def count_parameters(module: nn.Module) -> int:
     return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
 
+class RoPE:
+    """Rotary position embeddings (applied to q, k)."""
+    @staticmethod
+    def create_cos_sin_cache(seq_len: int, n_elem: int, base: float = 10000.0, device: str = 'cpu', dtype: torch.dtype = torch.float32):
+        # n_elem is head_dim
+        half = n_elem // 2
+        theta = 1.0 / (base ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
+        seq_idx = torch.arange(seq_len, device=device, dtype=torch.float32)
+        idx_theta = torch.outer(seq_idx, theta)  # [T, half]
+        cos = torch.cos(idx_theta).to(dtype)
+        sin = torch.sin(idx_theta).to(dtype)
+        return cos, sin  # each [T, half]
+
+    @staticmethod
+    def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        # x: [B, H, T, D]; cos/sin: [T, D/2]
+        B, H, T, D = x.shape
+        half = D // 2
+        x1 = x[..., :half]
+        x2 = x[..., half:]
+        cos_t = cos[:T].to(dtype=x.dtype, device=x.device)[None, None, :, :]
+        sin_t = sin[:T].to(dtype=x.dtype, device=x.device)[None, None, :, :]
+        xr1 = x1 * cos_t - x2 * sin_t
+        xr2 = x1 * sin_t + x2 * cos_t
+        return torch.cat([xr1, xr2], dim=-1)
+
+
 # ------------------------------ MoE parts ----------------------------
 
 class ExpertSwiGLU(nn.Module):
@@ -312,12 +339,17 @@ class MultiheadAttention(nn.Module):
         self.o_proj = nn.Linear(d_model, d_model, bias=bias)
         self.dropout_p = float(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
         b, t, d = x.shape
         h = self.n_head
         q = self.q_proj(x).view(b, t, h, -1).transpose(1, 2)  # [b,h,t,d]
         k = self.k_proj(x).view(b, t, h, -1).transpose(1, 2)
         v = self.v_proj(x).view(b, t, h, -1).transpose(1, 2)
+        # Optional RoPE
+        if rope_cache is not None:
+            cos, sin = rope_cache
+            q = RoPE.apply_rope(q, cos, sin)
+            k = RoPE.apply_rope(k, cos, sin)
         # Use PyTorch SDPA (enables Flash and mem-efficient kernels when available)
         y = F.scaled_dot_product_attention(
             q, k, v,
@@ -350,12 +382,17 @@ class GatedMultiheadAttention(nn.Module):
         self.gate_proj = nn.Linear(d_model, d_model, bias=bias)
         self.dropout_p = float(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
         b, t, d = x.shape
         h = self.n_head
         q = self.q_proj(x).view(b, t, h, -1).transpose(1, 2)  # [b,h,t,d_head]
         k = self.k_proj(x).view(b, t, h, -1).transpose(1, 2)
         v = self.v_proj(x).view(b, t, h, -1).transpose(1, 2)
+        # Optional RoPE
+        if rope_cache is not None:
+            cos, sin = rope_cache
+            q = RoPE.apply_rope(q, cos, sin)
+            k = RoPE.apply_rope(k, cos, sin)
 
         y = F.scaled_dot_product_attention(
             q, k, v,
@@ -378,9 +415,10 @@ class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, bias: bool, dropout: float,
                  n_experts: int, capacity_factor: float, dropless: bool,
                  load_balance_alpha: float, router_z_loss_coef: float,
-                 attn_gate: str = 'none'):
+                 attn_gate: str = 'none', use_rope: bool = True):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
+        self.use_rope = use_rope
         if attn_gate == 'sigmoid_head':
             self.attn = GatedMultiheadAttention(d_model, n_head, bias=bias, dropout=dropout)
         else:
@@ -393,8 +431,10 @@ class TransformerBlock(nn.Module):
             router_temperature=1.0, router_noise_std=0.0, router_noise_type='gumbel',
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        attn_in = self.ln1(x)
+        attn_out = self.attn(attn_in, rope_cache if self.use_rope else None)
+        x = x + attn_out
         y, aux = self.moe(self.ln2(x))
         x = x + y
         return x, aux
@@ -418,12 +458,18 @@ class TinyMoETransformer(nn.Module):
                  router_temperature: float = 1.0,
                  router_noise_std: float = 0.0,
                  router_noise_type: str = 'gumbel',
+                 use_rope: bool = True,
+                 rope_theta: float = 10000.0,
                  ):  # noqa: E501
         super().__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.d_model = d_model
+        self.use_rope = use_rope
+        self.head_dim = d_model // n_head
+        if self.use_rope:
+            assert (self.head_dim % 2) == 0, "head_dim must be even for RoPE"
 
         self.wte = nn.Embedding(vocab_size, d_model)
         self.drop = nn.Dropout(dropout)
@@ -433,6 +479,7 @@ class TinyMoETransformer(nn.Module):
                 n_experts, capacity_factor, dropless,
                 load_balance_alpha, router_z_loss_coef,
                 attn_gate=attn_gate,
+                use_rope=use_rope,
             )
             for _ in range(n_layer)
         ])
@@ -445,6 +492,15 @@ class TinyMoETransformer(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         # weight tying
         self.lm_head.weight = self.wte.weight
+
+        # RoPE cache stored at model level
+        if self.use_rope:
+            cos, sin = RoPE.create_cos_sin_cache(self.block_size, self.head_dim, base=rope_theta)
+            self.register_buffer('rope_cos', cos, persistent=False)
+            self.register_buffer('rope_sin', sin, persistent=False)
+        else:
+            self.rope_cos = None
+            self.rope_sin = None
 
         self.apply(self._init_weights)
 
@@ -462,8 +518,9 @@ class TinyMoETransformer(nn.Module):
         x = self.wte(idx)
         x = self.drop(x)
         aux_losses = []
+        rope_cache = (self.rope_cos, self.rope_sin) if self.use_rope else None
         for blk in self.h:
-            x, aux = blk(x)
+            x, aux = blk(x, rope_cache=rope_cache)
             aux_losses.append(aux)
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -516,6 +573,8 @@ class TrainConfig:
     load_balance_alpha: float = 0.05
     router_z_loss_coef: float = 0.0
     attn_gate: str = 'none'  # 'none' or 'sigmoid_head'
+    use_rope: bool = True
+    rope_theta: float = 10000.0
     # Router dynamics
     router_temp_init: float = 1.5
     router_temp_final: float = 1.0
@@ -655,6 +714,8 @@ def train(cfg: TrainConfig):
         router_temperature=cfg.router_temp_init,
         router_noise_std=cfg.router_noise_std_init,
         router_noise_type=cfg.router_noise_type,
+        use_rope=cfg.use_rope,
+        rope_theta=cfg.rope_theta,
     ).to(device=device, dtype=torch.bfloat16)
 
     total_params = model.num_parameters()
@@ -720,6 +781,7 @@ def train(cfg: TrainConfig):
     best_val = float('inf')
     t0 = time.time()
     tokens_seen = 0
+    clip_cum = 0
     for it in range(cfg.max_iters):
         lr = cosine_lr(it, cfg.learning_rate, cfg.min_lr, cfg.warmup_iters, cfg.lr_decay_iters)
         for pg in optimizer.param_groups:
@@ -797,11 +859,17 @@ def train(cfg: TrainConfig):
                 last_router_metrics = None
 
         grad_total_norm = None
+        clipped_flag = None
         if cfg.grad_clip > 0:
             try:
                 grad_total_norm = float(nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
+                if math.isfinite(grad_total_norm):
+                    clipped_flag = 1 if grad_total_norm > (cfg.grad_clip + 1e-12) else 0
+                    if clipped_flag:
+                        clip_cum += 1
             except Exception:
                 grad_total_norm = None
+                clipped_flag = None
         optimizer.step()
 
         # Logging
@@ -819,6 +887,10 @@ def train(cfg: TrainConfig):
             metrics['router/noise_std'] = curr_noise
             if grad_total_norm is not None and math.isfinite(grad_total_norm):
                 metrics['grad/global_norm'] = grad_total_norm
+                metrics['grad/clip_threshold'] = float(cfg.grad_clip)
+            if clipped_flag is not None:
+                metrics['grad/clipped'] = int(clipped_flag)
+                metrics['grad/clipped_cum'] = int(clip_cum)
             if last_router_metrics:
                 metrics.update(last_router_metrics)
             logger.log_metrics(metrics, step=it)
@@ -866,6 +938,10 @@ def main():
     p.add_argument('--load_balance_alpha', type=float, default=0.05)
     p.add_argument('--router_z_loss_coef', type=float, default=0.0)
     p.add_argument('--attn_gate', type=str, default='none', choices=['none', 'sigmoid_head'], help='Enable SDPA + elementwise head-specific sigmoid gate')
+    p.add_argument('--use_rope', dest='use_rope', action='store_true')
+    p.add_argument('--no-use_rope', dest='use_rope', action='store_false')
+    p.set_defaults(use_rope=True)
+    p.add_argument('--rope_theta', type=float, default=10000.0)
     # Router dynamics CLI
     p.add_argument('--router_temp_init', type=float, default=1.5)
     p.add_argument('--router_temp_final', type=float, default=1.0)

@@ -531,3 +531,4 @@ How to use
 
 Collapse check: watch router/max_frac_max (→ 1.0 is bad), router/active_min (→ 1 is bad), router/entropy_mean (drops), router/top1_p_mean (shoots up).
 Capacity mode: router/drop_frac_mean > 0 indicates capacity hits; consider raising capacity_factor or reducing batch size/n_experts, or switch to dropless.
+Expect router/max_frac_max to settle <0.8, active_min close to n_experts (or at least >2), entropy to stop free‑fall, and val loss to remain stable.
