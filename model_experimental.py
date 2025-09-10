@@ -62,7 +62,9 @@ class RMSNorm(nn.Module):
         x = x.float()
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         x = (x * rms).to(dtype)
-        return x * self.weight
+        # Return a fresh tensor to avoid potential cudagraph aliasing with torch.compile
+        out = x * self.weight
+        return out
 
 
 def swiglu(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -502,8 +504,21 @@ def train(cfg: TrainConfig):
     total_params = model.num_parameters()
     print(f"Model params: {total_params:,} ({total_params/1e6:.2f}M)")
     print(f"Config: layers={cfg.n_layer}, d_model={cfg.d_model}, heads={cfg.n_head}, experts={cfg.n_experts}")
+    compiled_enabled = False
     if cfg.compile and hasattr(torch, 'compile'):
         model = torch.compile(model, mode='max-autotune')
+        compiled_enabled = True
+
+    # cudagraph step marker for torch.compile
+    _mark_step = None
+    if compiled_enabled:
+        try:
+            from torch.compiler import cudagraph_mark_step_begin as _mark_step
+        except Exception:
+            try:
+                from torch._inductor import cudagraph_mark_step_begin as _mark_step
+            except Exception:
+                _mark_step = None
 
     # Optimizer
     decay_params, no_decay_params = [], []
@@ -542,7 +557,14 @@ def train(cfg: TrainConfig):
         total_loss = 0.0  # sum of raw micro losses (for averaging only)
         for micro in range(cfg.gradient_accumulation_steps):
             x, y = data.get_batch('train', cfg.batch_size)
+            if _mark_step is not None:
+                # Helps avoid cudagraph output aliasing across iterations
+                _mark_step()
             logits, loss = model(x, y)
+            if compiled_enabled:
+                # Ensure outputs are not aliased to cudagraph internal buffers
+                logits = logits.clone()
+                loss = loss.clone()
             (loss.float() / cfg.gradient_accumulation_steps).backward()
             total_loss += float(loss.detach())
             tokens_seen += (x.numel())
