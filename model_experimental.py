@@ -878,6 +878,18 @@ def train(cfg: TrainConfig):
     # Training loop
     model.train()
     best_val = float('inf')
+    # If a previous best exists, seed best_val so we don't overwrite with worse
+    ckpt_dir = Path(cfg.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_path = ckpt_dir / 'best_moe_bf16.pt'
+    if best_path.exists():
+        try:
+            prev = torch.load(best_path, map_location='cpu')
+            if isinstance(prev, dict) and 'val_loss' in prev:
+                best_val = float(prev['val_loss'])
+                print(f"Found existing best checkpoint with val_loss={best_val:.4f} at {best_path}")
+        except Exception as _e:
+            print(f"Warning: could not read existing best checkpoint: {_e}")
     t0 = time.time()
     tokens_seen = 0
     clip_cum = 0
@@ -1008,9 +1020,14 @@ def train(cfg: TrainConfig):
             val_loss = evaluate(model, data, cfg, cfg.eval_iters)
             logger.log_metrics({'val/loss': val_loss, 'val/ppl': math.exp(min(20.0, val_loss))}, step=it)
             print(f"eval | val_loss {val_loss:.4f}")
+            # Always save a rolling 'last' checkpoint for convenience
+            try:
+                torch.save({'model': model.state_dict(), 'cfg': asdict(cfg), 'val_loss': float(val_loss), 'iter': it}, ckpt_dir / 'last_moe_bf16.pt')
+            except Exception:
+                pass
+
             if val_loss < best_val:
                 best_val = val_loss
-                Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
                 ckpt_path = Path(cfg.checkpoint_dir) / 'best_moe_bf16.pt'
                 torch.save({'model': model.state_dict(), 'cfg': asdict(cfg), 'val_loss': val_loss, 'iter': it}, ckpt_path)
 
