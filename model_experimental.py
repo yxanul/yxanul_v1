@@ -34,6 +34,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    import torch._dynamo as _dynamo
+    _dynamo_disable = _dynamo.disable
+except Exception:
+    def _dynamo_disable(fn):
+        return fn
 
 try:
     from wandb_logger import WandBLogger
@@ -174,6 +180,7 @@ class MoE(nn.Module):
         if self._dense_fallback:
             self.dense = ExpertSwiGLU(d_model, bias=bias, dropout=dropout)
 
+    @_dynamo_disable  # avoid torch.compile capturing highly dynamic routing code
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         b, t, d = x.shape
         if self._dense_fallback:
@@ -506,6 +513,22 @@ def train(cfg: TrainConfig):
     print(f"Config: layers={cfg.n_layer}, d_model={cfg.d_model}, heads={cfg.n_head}, experts={cfg.n_experts}")
     compiled_enabled = False
     if cfg.compile and hasattr(torch, 'compile'):
+        # Configure inductor to skip cudagraphs for dynamic shapes (MoE token counts vary per step)
+        try:
+            import torch._inductor.config as inductor_config
+            # Prefer skipping cudagraph capture on dynamic graphs to avoid aliasing/overwrites
+            if hasattr(inductor_config.triton, 'cudagraph_skip_dynamic_graphs'):
+                inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+            if hasattr(inductor_config.triton, 'cudagraph_dynamic_shape_warn_limit'):
+                # Silence or limit warnings (set to None or 0 to silence)
+                inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None
+            # As a stronger fallback, try disabling cudagraphs entirely if available
+            if hasattr(inductor_config.triton, 'cudagraphs'):
+                # Disable cudagraphs to avoid aliasing with gradient accumulation
+                inductor_config.triton.cudagraphs = False
+        except Exception:
+            pass
+
         model = torch.compile(model, mode='max-autotune')
         compiled_enabled = True
 
