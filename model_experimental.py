@@ -221,9 +221,11 @@ class MoE(nn.Module):
     def __init__(self, d_model: int, n_experts: int, bias: bool, dropout: float,
                  capacity_factor: float = 1.25, dropless: bool = True,
                  load_balance_alpha: float = 0.05, router_z_loss_coef: float = 0.0,
-                 router_temperature: float = 1.0, router_noise_std: float = 0.0, router_noise_type: str = 'gumbel'):
+                 router_temperature: float = 1.0, router_noise_std: float = 0.0, router_noise_type: str = 'gumbel',
+                 grouped: bool = False):
         super().__init__()
         self.n_experts = n_experts
+        self.grouped = bool(grouped)
         self.router = Top1Router(
             d_model, n_experts, capacity_factor, dropless,
             load_balance_alpha, router_z_loss_coef,
@@ -284,44 +286,132 @@ class MoE(nn.Module):
             # Capacity-limited variant (tokens beyond capacity are dropped to zero contribution)
             N = b * t
             cap = int(math.ceil(self.router.capacity_factor * (N / self.n_experts)))
-            y_flat = torch.zeros_like(x_flat)
-            processed = 0
-            for e in range(self.n_experts):
-                # Select up to cap tokens with highest prob to expert e
-                p_e = probs[:, e]
-                # find tokens routed to e
-                routed = (top1_idx == e)
-                if routed.any():
-                    idx_e = torch.nonzero(routed, as_tuple=False).squeeze(-1)
-                    if idx_e.numel() > cap:
-                        # pick top-k by probability
-                        pe = p_e[idx_e]
-                        topk = torch.topk(pe, cap, dim=0).indices
-                        idx_e = idx_e[topk]
-                    xe = x_flat[idx_e]
-                    ye = self.experts[e](xe)
-                    ye = ye * p_e[idx_e].unsqueeze(-1)
-                    y_flat[idx_e] = ye
+            if not self.grouped:
+                y_flat = torch.zeros_like(x_flat)
+                processed = 0
+                for e in range(self.n_experts):
+                    # Select up to cap tokens with highest prob to expert e
+                    p_e = probs[:, e]
+                    routed = (top1_idx == e)
+                    if routed.any():
+                        idx_e = torch.nonzero(routed, as_tuple=False).squeeze(-1)
+                        if idx_e.numel() > cap:
+                            pe = p_e[idx_e]
+                            topk = torch.topk(pe, cap, dim=0).indices
+                            idx_e = idx_e[topk]
+                        xe = x_flat[idx_e]
+                        ye = self.experts[e](xe)
+                        ye = ye * p_e[idx_e].unsqueeze(-1)
+                        y_flat[idx_e] = ye
+                        processed += int(idx_e.numel())
+                y = y_flat.reshape(b, t, d)
+                with torch.no_grad():
+                    max_frac = me.max()
+                    num_active = (me > 0).sum()
+                    drop_frac = torch.tensor(1.0 - (processed / max(1, N)), device=x.device)
+                    top1_p_mean = top1_p.mean()
+                self._last_stats = {
+                    'aux': aux.detach(),
+                    'me': me.detach(),
+                    'ce': ce.detach(),
+                    'entropy_mean': entropy_mean.detach(),
+                    'max_frac': max_frac.detach(),
+                    'num_active': num_active.detach(),
+                    'drop_frac': drop_frac.detach(),
+                    'top1_p_mean': top1_p_mean.detach(),
+                    'tokens': torch.tensor(b * t, device=x.device),
+                    'cap': torch.tensor(cap, device=x.device),
+                }
+                return self.dropout(y), aux
+            else:
+                # Grouped/padded dispatch with batched GEMMs across experts
+                device = x_flat.device
+                dtype = x_flat.dtype
+                d_model = d
+                # Prepare per-expert indices up to capacity
+                idx_lists = []
+                counts = []
+                processed = 0
+                for e in range(self.n_experts):
+                    p_e = probs[:, e]
+                    routed = (top1_idx == e)
+                    if routed.any():
+                        idx_e = torch.nonzero(routed, as_tuple=False).squeeze(-1)
+                        if idx_e.numel() > cap:
+                            pe = p_e[idx_e]
+                            topk = torch.topk(pe, cap, dim=0).indices
+                            idx_e = idx_e[topk]
+                    else:
+                        idx_e = torch.empty(0, dtype=torch.long, device=device)
+                    counts.append(int(idx_e.numel()))
                     processed += int(idx_e.numel())
-            y = y_flat.reshape(b, t, d)
-            with torch.no_grad():
-                max_frac = me.max()
-                num_active = (me > 0).sum()
-                drop_frac = torch.tensor(1.0 - (processed / max(1, N)), device=x.device)
-                top1_p_mean = top1_p.mean()
-            self._last_stats = {
-                'aux': aux.detach(),
-                'me': me.detach(),
-                'ce': ce.detach(),
-                'entropy_mean': entropy_mean.detach(),
-                'max_frac': max_frac.detach(),
-                'num_active': num_active.detach(),
-                'drop_frac': drop_frac.detach(),
-                'top1_p_mean': top1_p_mean.detach(),
-                'tokens': torch.tensor(b * t, device=x.device),
-                'cap': torch.tensor(cap, device=x.device),
-            }
-            return self.dropout(y), aux
+                    # pad to cap
+                    if idx_e.numel() < cap:
+                        pad = torch.full((cap - idx_e.numel(),), -1, dtype=torch.long, device=device)
+                        idx_e = torch.cat([idx_e, pad], dim=0)
+                    else:
+                        idx_e = idx_e[:cap]
+                    idx_lists.append(idx_e)
+
+                idx_mat = torch.stack(idx_lists, dim=0)  # [E, cap]
+                valid_mask = (idx_mat >= 0)
+                # Gather tokens with padding
+                safe_idx = idx_mat.clamp_min(0)
+                x_grouped = x_flat[safe_idx]            # [E, cap, d]
+                gate_grouped = torch.zeros((self.n_experts, cap, 1), device=device, dtype=dtype)
+                # selected prob per token for the chosen expert
+                top1_p_grouped = top1_p[safe_idx]
+                gate_grouped[valid_mask] = top1_p_grouped[valid_mask].unsqueeze(-1).to(dtype)
+
+                # Stack weights for grouped GEMMs
+                # up_u
+                Wu = torch.stack([exp.up_u.weight for exp in self.experts], dim=0).to(dtype)  # [E, hidden, d]
+                WuT = Wu.transpose(1, 2)  # [E, d, hidden]
+                bu = torch.stack([exp.up_u.bias if exp.up_u.bias is not None else torch.zeros(exp.up_u.out_features, device=device, dtype=dtype) for exp in self.experts], dim=0).to(dtype)
+                # up_v
+                Wv = torch.stack([exp.up_v.weight for exp in self.experts], dim=0).to(dtype)
+                WvT = Wv.transpose(1, 2)
+                bv = torch.stack([exp.up_v.bias if exp.up_v.bias is not None else torch.zeros(exp.up_v.out_features, device=device, dtype=dtype) for exp in self.experts], dim=0).to(dtype)
+                # down
+                WdT = torch.stack([exp.down.weight.t() for exp in self.experts], dim=0).to(dtype)  # [E, hidden, d]
+                bd = torch.stack([exp.down.bias if exp.down.bias is not None else torch.zeros(exp.down.out_features, device=device, dtype=dtype) for exp in self.experts], dim=0).to(dtype)
+
+                # Batched GEMMs
+                U = torch.bmm(x_grouped, WuT) + bu.unsqueeze(1)  # [E, cap, hidden]
+                V = torch.bmm(x_grouped, WvT) + bv.unsqueeze(1)
+                H = swiglu(U, V)
+                Y = torch.bmm(H, WdT) + bd.unsqueeze(1)  # [E, cap, d]
+                Y = Y * gate_grouped
+                # Zero-out padding rows
+                Y = Y.masked_fill(~valid_mask.unsqueeze(-1), 0)
+
+                # Scatter back
+                y_flat = torch.zeros_like(x_flat)
+                for e in range(self.n_experts):
+                    cnt = counts[e]
+                    if cnt > 0:
+                        idx_valid = idx_mat[e, :cnt]
+                        y_flat.index_copy_(0, idx_valid, Y[e, :cnt])
+
+                y = y_flat.reshape(b, t, d)
+                with torch.no_grad():
+                    max_frac = me.max()
+                    num_active = (me > 0).sum()
+                    drop_frac = torch.tensor(1.0 - (processed / max(1, N)), device=x.device)
+                    top1_p_mean = top1_p.mean()
+                self._last_stats = {
+                    'aux': aux.detach(),
+                    'me': me.detach(),
+                    'ce': ce.detach(),
+                    'entropy_mean': entropy_mean.detach(),
+                    'max_frac': max_frac.detach(),
+                    'num_active': num_active.detach(),
+                    'drop_frac': drop_frac.detach(),
+                    'top1_p_mean': top1_p_mean.detach(),
+                    'tokens': torch.tensor(b * t, device=x.device),
+                    'cap': torch.tensor(cap, device=x.device),
+                }
+                return self.dropout(y), aux
 
 
 # --------------------------- Transformer blocks ---------------------------
@@ -429,6 +519,7 @@ class TransformerBlock(nn.Module):
             capacity_factor=capacity_factor, dropless=dropless,
             load_balance_alpha=load_balance_alpha, router_z_loss_coef=router_z_loss_coef,
             router_temperature=1.0, router_noise_std=0.0, router_noise_type='gumbel',
+            grouped=False,
         )
 
     def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -460,6 +551,7 @@ class TinyMoETransformer(nn.Module):
                  router_noise_type: str = 'gumbel',
                  use_rope: bool = True,
                  rope_theta: float = 10000.0,
+                 moe_grouped: bool = False,
                  ):  # noqa: E501
         super().__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
@@ -483,6 +575,11 @@ class TinyMoETransformer(nn.Module):
             )
             for _ in range(n_layer)
         ])
+        # set grouped flag into each block's MoE
+        if moe_grouped:
+            for blk in self.h:
+                if hasattr(blk, 'moe'):
+                    blk.moe.grouped = True
         # initialize router dynamics state across blocks
         for blk in self.h:
             if hasattr(blk, 'moe'):
@@ -582,6 +679,7 @@ class TrainConfig:
     router_noise_std_init: float = 0.5
     router_noise_decay_iters: int = 1000
     router_noise_type: str = 'gumbel'  # 'gumbel' or 'gaussian'
+    moe_grouped: bool = False
 
     # Training
     device: str = 'cuda'
@@ -716,6 +814,7 @@ def train(cfg: TrainConfig):
         router_noise_type=cfg.router_noise_type,
         use_rope=cfg.use_rope,
         rope_theta=cfg.rope_theta,
+        moe_grouped=cfg.moe_grouped,
     ).to(device=device, dtype=torch.bfloat16)
 
     total_params = model.num_parameters()
@@ -949,6 +1048,7 @@ def main():
     p.add_argument('--router_noise_std_init', type=float, default=0.5)
     p.add_argument('--router_noise_decay_iters', type=int, default=1000)
     p.add_argument('--router_noise_type', type=str, default='gumbel', choices=['gumbel', 'gaussian'])
+    p.add_argument('--moe_grouped', action='store_true', help='Use grouped/padded MoE with batched GEMMs (capacity mode)')
 
     # Train
     p.add_argument('--device', type=str, default='cuda')
