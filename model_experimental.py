@@ -114,7 +114,8 @@ class Top1Router(nn.Module):
     When dropless=False: enforces per-expert capacity; extra tokens are dropped (masked to zero contribution).
     """
     def __init__(self, d_model: int, n_experts: int, capacity_factor: float = 1.25, dropless: bool = True,
-                 load_balance_alpha: float = 0.05, router_z_loss_coef: float = 0.0):
+                 load_balance_alpha: float = 0.05, router_z_loss_coef: float = 0.0,
+                 temperature: float = 1.0, noise_std: float = 0.0, noise_type: str = 'gumbel'):
         super().__init__()
         self.n_experts = n_experts
         self.capacity_factor = capacity_factor
@@ -122,6 +123,17 @@ class Top1Router(nn.Module):
         self.load_balance_alpha = load_balance_alpha
         self.router_z_loss_coef = router_z_loss_coef
         self.w_gating = nn.Linear(d_model, n_experts, bias=True)
+        # routing dynamics
+        self.temperature = float(temperature)
+        self.noise_std = float(noise_std)
+        self.noise_type = str(noise_type)
+
+    @torch.no_grad()
+    def set_router_state(self, temperature: Optional[float] = None, noise_std: Optional[float] = None):
+        if temperature is not None:
+            self.temperature = float(temperature)
+        if noise_std is not None:
+            self.noise_std = float(noise_std)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute routing decisions.
@@ -136,8 +148,21 @@ class Top1Router(nn.Module):
         - entropy_mean: [1] mean token entropy of router softmax (no grad)
         """
         logits = self.w_gating(x)  # [N, E]
-        probs = F.softmax(logits, dim=-1)
-        top1_prob, top1_idx = probs.max(dim=-1)
+        temp = max(1e-5, float(self.temperature))
+        logits_base = logits / temp
+        probs = F.softmax(logits_base, dim=-1)
+        # Noisy top-1 selection for exploration (does not affect aux stats)
+        logits_sel = logits_base
+        if self.training and self.noise_std > 1e-8:
+            if self.noise_type == 'gumbel':
+                u = torch.rand_like(logits_sel).clamp_(1e-6, 1 - 1e-6)
+                g = -torch.log(-torch.log(u))
+                logits_sel = logits_sel + self.noise_std * g
+            else:  # gaussian
+                logits_sel = logits_sel + self.noise_std * torch.randn_like(logits_sel)
+        top1_idx = logits_sel.argmax(dim=-1)
+        # Use non-noisy probs to compute selected probability
+        top1_prob = probs.gather(-1, top1_idx.unsqueeze(-1)).squeeze(-1)
 
         # Load balancing auxiliary loss (Switch-Transformer style)
         # fraction of tokens per expert (me) and mean probability per expert (ce)
@@ -168,12 +193,14 @@ class MoE(nn.Module):
     """
     def __init__(self, d_model: int, n_experts: int, bias: bool, dropout: float,
                  capacity_factor: float = 1.25, dropless: bool = True,
-                 load_balance_alpha: float = 0.05, router_z_loss_coef: float = 0.0):
+                 load_balance_alpha: float = 0.05, router_z_loss_coef: float = 0.0,
+                 router_temperature: float = 1.0, router_noise_std: float = 0.0, router_noise_type: str = 'gumbel'):
         super().__init__()
         self.n_experts = n_experts
         self.router = Top1Router(
             d_model, n_experts, capacity_factor, dropless,
             load_balance_alpha, router_z_loss_coef,
+            temperature=router_temperature, noise_std=router_noise_std, noise_type=router_noise_type,
         )
         self.experts = nn.ModuleList([
             ExpertSwiGLU(d_model, bias=bias, dropout=dropout) for _ in range(n_experts)
@@ -363,6 +390,7 @@ class TransformerBlock(nn.Module):
             d_model, n_experts, bias=bias, dropout=dropout,
             capacity_factor=capacity_factor, dropless=dropless,
             load_balance_alpha=load_balance_alpha, router_z_loss_coef=router_z_loss_coef,
+            router_temperature=1.0, router_noise_std=0.0, router_noise_type='gumbel',
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -387,6 +415,9 @@ class TinyMoETransformer(nn.Module):
                  load_balance_alpha: float = 0.05,
                  router_z_loss_coef: float = 0.0,
                  attn_gate: str = 'none',
+                 router_temperature: float = 1.0,
+                 router_noise_std: float = 0.0,
+                 router_noise_type: str = 'gumbel',
                  ):  # noqa: E501
         super().__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
@@ -405,6 +436,11 @@ class TinyMoETransformer(nn.Module):
             )
             for _ in range(n_layer)
         ])
+        # initialize router dynamics state across blocks
+        for blk in self.h:
+            if hasattr(blk, 'moe'):
+                blk.moe.router.set_router_state(router_temperature, router_noise_std)
+                blk.moe.router.noise_type = router_noise_type
         self.ln_f = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         # weight tying
@@ -480,6 +516,13 @@ class TrainConfig:
     load_balance_alpha: float = 0.05
     router_z_loss_coef: float = 0.0
     attn_gate: str = 'none'  # 'none' or 'sigmoid_head'
+    # Router dynamics
+    router_temp_init: float = 1.5
+    router_temp_final: float = 1.0
+    router_temp_anneal_iters: int = 1000
+    router_noise_std_init: float = 0.5
+    router_noise_decay_iters: int = 1000
+    router_noise_type: str = 'gumbel'  # 'gumbel' or 'gaussian'
 
     # Training
     device: str = 'cuda'
@@ -565,6 +608,15 @@ def cosine_lr(it: int, base_lr: float, min_lr: float, warmup: int, total: int) -
     return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def _anneal_linear(it: int, init_v: float, final_v: float, total: int) -> float:
+    if total <= 0:
+        return final_v
+    if it >= total:
+        return final_v
+    a = it / float(total)
+    return (1 - a) * init_v + a * final_v
+
+
 def evaluate(model: TinyMoETransformer, data: BinDataLoader, cfg: TrainConfig, eval_iters: int) -> float:
     model.eval()
     losses = []
@@ -600,6 +652,9 @@ def train(cfg: TrainConfig):
         load_balance_alpha=cfg.load_balance_alpha,
         router_z_loss_coef=cfg.router_z_loss_coef,
         attn_gate=cfg.attn_gate,
+        router_temperature=cfg.router_temp_init,
+        router_noise_std=cfg.router_noise_std_init,
+        router_noise_type=cfg.router_noise_type,
     ).to(device=device, dtype=torch.bfloat16)
 
     total_params = model.num_parameters()
@@ -678,6 +733,12 @@ def train(cfg: TrainConfig):
             if _mark_step is not None:
                 # Helps avoid cudagraph output aliasing across iterations
                 _mark_step()
+            # Update router schedules (temperature and noise) per-step
+            curr_temp = _anneal_linear(it, cfg.router_temp_init, cfg.router_temp_final, cfg.router_temp_anneal_iters)
+            curr_noise = _anneal_linear(it, cfg.router_noise_std_init, 0.0, cfg.router_noise_decay_iters)
+            for blk in model.h:
+                if hasattr(blk, 'moe'):
+                    blk.moe.router.set_router_state(curr_temp, curr_noise)
             logits, loss = model(x, y)
             if compiled_enabled:
                 # Ensure outputs are not aliased to cudagraph internal buffers
@@ -753,6 +814,9 @@ def train(cfg: TrainConfig):
                 'train/lr': lr,
                 'speed/tokens_per_s': tps,
             }
+            # Router schedule metrics
+            metrics['router/temp'] = curr_temp
+            metrics['router/noise_std'] = curr_noise
             if grad_total_norm is not None and math.isfinite(grad_total_norm):
                 metrics['grad/global_norm'] = grad_total_norm
             if last_router_metrics:
@@ -802,6 +866,13 @@ def main():
     p.add_argument('--load_balance_alpha', type=float, default=0.05)
     p.add_argument('--router_z_loss_coef', type=float, default=0.0)
     p.add_argument('--attn_gate', type=str, default='none', choices=['none', 'sigmoid_head'], help='Enable SDPA + elementwise head-specific sigmoid gate')
+    # Router dynamics CLI
+    p.add_argument('--router_temp_init', type=float, default=1.5)
+    p.add_argument('--router_temp_final', type=float, default=1.0)
+    p.add_argument('--router_temp_anneal_iters', type=int, default=1000)
+    p.add_argument('--router_noise_std_init', type=float, default=0.5)
+    p.add_argument('--router_noise_decay_iters', type=int, default=1000)
+    p.add_argument('--router_noise_type', type=str, default='gumbel', choices=['gumbel', 'gaussian'])
 
     # Train
     p.add_argument('--device', type=str, default='cuda')

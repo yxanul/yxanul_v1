@@ -517,3 +517,17 @@ iter 600: loss 4.2138, lr 1.80e-04, 143.2k tok/s, FP8: True
 Step 600: val loss 3.0353
 Saving checkpoint to checkpoints_fp8_optimized/best_model_fp8_optimized.pt
 iter 620: loss 4.0071, lr 1.86e-04, 137.0k tok/s, FP8: True
+
+
+
+
+
+FOR @MODEL_EXPERIMENTAL.PY ! ! !
+How it works
+
+Each MoE layer stores lightweight stats during forward; the trainer aggregates and logs them once per iteration alongside loss/lr/tokens_per_s.
+Overhead is minimal (small reductions to CPU floats only for logging).
+How to use
+
+Collapse check: watch router/max_frac_max (→ 1.0 is bad), router/active_min (→ 1 is bad), router/entropy_mean (drops), router/top1_p_mean (shoots up).
+Capacity mode: router/drop_frac_mean > 0 indicates capacity hits; consider raising capacity_factor or reducing batch size/n_experts, or switch to dropless.
