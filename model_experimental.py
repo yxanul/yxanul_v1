@@ -539,12 +539,12 @@ def train(cfg: TrainConfig):
             pg['lr'] = lr
 
         optimizer.zero_grad(set_to_none=True)
-        total_loss = 0.0
+        total_loss = 0.0  # sum of raw micro losses (for averaging only)
         for micro in range(cfg.gradient_accumulation_steps):
             x, y = data.get_batch('train', cfg.batch_size)
             logits, loss = model(x, y)
             (loss.float() / cfg.gradient_accumulation_steps).backward()
-            total_loss += loss.item()
+            total_loss += float(loss.detach())
             tokens_seen += (x.numel())
 
         if cfg.grad_clip > 0:
@@ -555,12 +555,13 @@ def train(cfg: TrainConfig):
         if (it % cfg.log_interval) == 0:
             dt = max(1e-6, time.time() - t0)
             tps = tokens_seen / dt
+            avg_loss = total_loss / max(1, cfg.gradient_accumulation_steps)
             logger.log_metrics({
-                'train/loss': total_loss,
+                'train/loss': avg_loss,
                 'train/lr': lr,
                 'speed/tokens_per_s': tps,
             }, step=it)
-            print(f"iter {it:6d} | loss {total_loss:.4f} | lr {lr:.3e} | {tps:.0f} tok/s")
+            print(f"iter {it:6d} | loss {avg_loss:.4f} | lr {lr:.3e} | {tps:.0f} tok/s")
             t0 = time.time(); tokens_seen = 0
 
         # Eval
@@ -636,4 +637,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
