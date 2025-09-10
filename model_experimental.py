@@ -123,7 +123,7 @@ class Top1Router(nn.Module):
         self.router_z_loss_coef = router_z_loss_coef
         self.w_gating = nn.Linear(d_model, n_experts, bias=True)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute routing decisions.
 
         Returns
@@ -131,6 +131,9 @@ class Top1Router(nn.Module):
         - top1_idx: [N] selected expert indices
         - top1_prob: [N] selected expert probabilities
         - aux_loss: scalar tensor for load balancing (and router z-loss if enabled)
+        - me: [E] fraction of tokens per expert (no grad)
+        - ce: [E] mean gate prob per expert (no grad)
+        - entropy_mean: [1] mean token entropy of router softmax (no grad)
         """
         logits = self.w_gating(x)  # [N, E]
         probs = F.softmax(logits, dim=-1)
@@ -143,6 +146,8 @@ class Top1Router(nn.Module):
             one_hot_assign = F.one_hot(top1_idx, num_classes=E).float()
             me = one_hot_assign.mean(dim=0)  # [E]
             ce = probs.mean(dim=0)           # [E]
+            # Router entropy across tokens
+            entropy_mean = (-(probs.clamp_min(1e-9).log() * probs).sum(dim=-1)).mean()
         aux = (self.n_experts * (me * ce).sum())
         aux = self.load_balance_alpha * aux
 
@@ -152,7 +157,7 @@ class Top1Router(nn.Module):
             z_loss = (z.square()).mean() * self.router_z_loss_coef
             aux = aux + z_loss.to(aux.dtype)
 
-        return probs, top1_idx, top1_prob, aux
+        return probs, top1_idx, top1_prob, aux, me, ce, entropy_mean
 
 
 class MoE(nn.Module):
@@ -188,7 +193,7 @@ class MoE(nn.Module):
 
         # Flatten tokens to route per-token
         x_flat = x.reshape(b * t, d)
-        probs, top1_idx, top1_p, aux = self.router(x_flat)
+        probs, top1_idx, top1_p, aux, me, ce, entropy_mean = self.router(x_flat)
 
         if self.router.dropless:
             # Dropless: process all tokens by their chosen expert and scatter back
@@ -202,12 +207,31 @@ class MoE(nn.Module):
                     ye = ye * top1_p[mask].unsqueeze(-1)
                     y_flat[mask] = ye
             y = y_flat.reshape(b, t, d)
+            # Stats (no drops in dropless)
+            with torch.no_grad():
+                max_frac = me.max()
+                num_active = (me > 0).sum()
+                drop_frac = torch.zeros((), dtype=torch.float32, device=x.device)
+                top1_p_mean = top1_p.mean()
+            # Store for logging
+            self._last_stats = {
+                'aux': aux.detach(),
+                'me': me.detach(),
+                'ce': ce.detach(),
+                'entropy_mean': entropy_mean.detach(),
+                'max_frac': max_frac.detach(),
+                'num_active': num_active.detach(),
+                'drop_frac': drop_frac.detach(),
+                'top1_p_mean': top1_p_mean.detach(),
+                'tokens': torch.tensor(b * t, device=x.device),
+            }
             return self.dropout(y), aux
         else:
             # Capacity-limited variant (tokens beyond capacity are dropped to zero contribution)
             N = b * t
             cap = int(math.ceil(self.router.capacity_factor * (N / self.n_experts)))
             y_flat = torch.zeros_like(x_flat)
+            processed = 0
             for e in range(self.n_experts):
                 # Select up to cap tokens with highest prob to expert e
                 p_e = probs[:, e]
@@ -224,7 +248,25 @@ class MoE(nn.Module):
                     ye = self.experts[e](xe)
                     ye = ye * p_e[idx_e].unsqueeze(-1)
                     y_flat[idx_e] = ye
+                    processed += int(idx_e.numel())
             y = y_flat.reshape(b, t, d)
+            with torch.no_grad():
+                max_frac = me.max()
+                num_active = (me > 0).sum()
+                drop_frac = torch.tensor(1.0 - (processed / max(1, N)), device=x.device)
+                top1_p_mean = top1_p.mean()
+            self._last_stats = {
+                'aux': aux.detach(),
+                'me': me.detach(),
+                'ce': ce.detach(),
+                'entropy_mean': entropy_mean.detach(),
+                'max_frac': max_frac.detach(),
+                'num_active': num_active.detach(),
+                'drop_frac': drop_frac.detach(),
+                'top1_p_mean': top1_p_mean.detach(),
+                'tokens': torch.tensor(b * t, device=x.device),
+                'cap': torch.tensor(cap, device=x.device),
+            }
             return self.dropout(y), aux
 
 
@@ -261,13 +303,61 @@ class MultiheadAttention(nn.Module):
         return y
 
 
+class GatedMultiheadAttention(nn.Module):
+    """SDPA attention with per-head, elementwise sigmoid gate (Qwen-style).
+
+    Gate is computed from the input x via a linear projection with sigmoid.
+    Then applied multiplicatively to the attention output per-head before o_proj.
+    """
+    def __init__(self, d_model: int, n_head: int, bias: bool = False, dropout: float = 0.0):
+        super().__init__()
+        assert d_model % n_head == 0
+        self.d_model = d_model
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        self.q_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.k_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.v_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.o_proj = nn.Linear(d_model, d_model, bias=bias)
+        # Gate projection (head-specific via reshape)
+        self.gate_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.dropout_p = float(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, d = x.shape
+        h = self.n_head
+        q = self.q_proj(x).view(b, t, h, -1).transpose(1, 2)  # [b,h,t,d_head]
+        k = self.k_proj(x).view(b, t, h, -1).transpose(1, 2)
+        v = self.v_proj(x).view(b, t, h, -1).transpose(1, 2)
+
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=True,
+        )  # [b,h,t,d_head]
+
+        # Elementwise, head-specific, sigmoid gate
+        gate = torch.sigmoid(self.gate_proj(x))              # [b,t,d_model]
+        gate = gate.view(b, t, h, -1).transpose(1, 2)        # [b,h,t,d_head]
+        y = y * gate
+
+        y = y.transpose(1, 2).contiguous().view(b, t, d)
+        y = self.o_proj(y)
+        return y
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, bias: bool, dropout: float,
                  n_experts: int, capacity_factor: float, dropless: bool,
-                 load_balance_alpha: float, router_z_loss_coef: float):
+                 load_balance_alpha: float, router_z_loss_coef: float,
+                 attn_gate: str = 'none'):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
-        self.attn = MultiheadAttention(d_model, n_head, bias=bias, dropout=dropout)
+        if attn_gate == 'sigmoid_head':
+            self.attn = GatedMultiheadAttention(d_model, n_head, bias=bias, dropout=dropout)
+        else:
+            self.attn = MultiheadAttention(d_model, n_head, bias=bias, dropout=dropout)
         self.ln2 = RMSNorm(d_model)
         self.moe = MoE(
             d_model, n_experts, bias=bias, dropout=dropout,
@@ -296,6 +386,7 @@ class TinyMoETransformer(nn.Module):
                  dropless: bool = True,
                  load_balance_alpha: float = 0.05,
                  router_z_loss_coef: float = 0.0,
+                 attn_gate: str = 'none',
                  ):  # noqa: E501
         super().__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
@@ -310,6 +401,7 @@ class TinyMoETransformer(nn.Module):
                 d_model, n_head, bias, dropout,
                 n_experts, capacity_factor, dropless,
                 load_balance_alpha, router_z_loss_coef,
+                attn_gate=attn_gate,
             )
             for _ in range(n_layer)
         ])
@@ -387,6 +479,7 @@ class TrainConfig:
     dropless: bool = True
     load_balance_alpha: float = 0.05
     router_z_loss_coef: float = 0.0
+    attn_gate: str = 'none'  # 'none' or 'sigmoid_head'
 
     # Training
     device: str = 'cuda'
@@ -506,6 +599,7 @@ def train(cfg: TrainConfig):
         dropless=cfg.dropless,
         load_balance_alpha=cfg.load_balance_alpha,
         router_z_loss_coef=cfg.router_z_loss_coef,
+        attn_gate=cfg.attn_gate,
     ).to(device=device, dtype=torch.bfloat16)
 
     total_params = model.num_parameters()
@@ -578,6 +672,7 @@ def train(cfg: TrainConfig):
 
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0  # sum of raw micro losses (for averaging only)
+        last_router_metrics = None
         for micro in range(cfg.gradient_accumulation_steps):
             x, y = data.get_batch('train', cfg.batch_size)
             if _mark_step is not None:
@@ -592,8 +687,60 @@ def train(cfg: TrainConfig):
             total_loss += float(loss.detach())
             tokens_seen += (x.numel())
 
+            # Gather router/expert stats from this micro-step (use the last one for logging)
+            try:
+                layers_stats = []
+                for i, blk in enumerate(model.h):
+                    moe = getattr(blk, 'moe', None)
+                    if moe is None or getattr(moe, '_dense_fallback', False):
+                        continue
+                    st = getattr(moe, '_last_stats', None)
+                    if st is None:
+                        continue
+                    # Move small scalars to CPU floats for logging
+                    entry = {
+                        'layer': i,
+                        'aux': float(st['aux'].detach().float().cpu()),
+                        'max_frac': float(st['max_frac'].detach().float().cpu()),
+                        'num_active': int(st['num_active'].detach().long().cpu()),
+                        'drop_frac': float(st['drop_frac'].detach().float().cpu()),
+                        'top1_p_mean': float(st['top1_p_mean'].detach().float().cpu()),
+                        'entropy_mean': float(st['entropy_mean'].detach().float().cpu()),
+                    }
+                    # Per-expert fractions summary
+                    me = st['me'].detach().float().cpu()
+                    entry['me_mean'] = float(me.mean())
+                    entry['me_max'] = float(me.max())
+                    entry['me_min'] = float(me.min())
+                    layers_stats.append(entry)
+                if layers_stats:
+                    # Aggregate across layers
+                    max_fracs = [e['max_frac'] for e in layers_stats]
+                    num_active = [e['num_active'] for e in layers_stats]
+                    auxs = [e['aux'] for e in layers_stats]
+                    drops = [e['drop_frac'] for e in layers_stats]
+                    tpm = [e['top1_p_mean'] for e in layers_stats]
+                    ent = [e['entropy_mean'] for e in layers_stats]
+                    last_router_metrics = {
+                        'router/aux_mean': sum(auxs) / len(auxs),
+                        'router/max_frac_mean': sum(max_fracs) / len(max_fracs),
+                        'router/max_frac_max': max(max_fracs),
+                        'router/active_min': min(num_active),
+                        'router/active_mean': sum(num_active) / len(num_active),
+                        'router/drop_frac_mean': sum(drops) / len(drops),
+                        'router/top1_p_mean': sum(tpm) / len(tpm),
+                        'router/entropy_mean': sum(ent) / len(ent),
+                    }
+                    last_router_metrics['router/collapsed'] = 1 if last_router_metrics['router/max_frac_max'] >= 0.90 or last_router_metrics['router/active_min'] <= 1 else 0
+            except Exception:
+                last_router_metrics = None
+
+        grad_total_norm = None
         if cfg.grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            try:
+                grad_total_norm = float(nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
+            except Exception:
+                grad_total_norm = None
         optimizer.step()
 
         # Logging
@@ -601,12 +748,24 @@ def train(cfg: TrainConfig):
             dt = max(1e-6, time.time() - t0)
             tps = tokens_seen / dt
             avg_loss = total_loss / max(1, cfg.gradient_accumulation_steps)
-            logger.log_metrics({
+            metrics = {
                 'train/loss': avg_loss,
                 'train/lr': lr,
                 'speed/tokens_per_s': tps,
-            }, step=it)
-            print(f"iter {it:6d} | loss {avg_loss:.4f} | lr {lr:.3e} | {tps:.0f} tok/s")
+            }
+            if grad_total_norm is not None and math.isfinite(grad_total_norm):
+                metrics['grad/global_norm'] = grad_total_norm
+            if last_router_metrics:
+                metrics.update(last_router_metrics)
+            logger.log_metrics(metrics, step=it)
+            # Console summary with key router signals
+            if last_router_metrics:
+                rf = last_router_metrics['router/max_frac_max']
+                na = last_router_metrics['router/active_min']
+                col = last_router_metrics['router/collapsed']
+                print(f"iter {it:6d} | loss {avg_loss:.4f} | lr {lr:.3e} | {tps:.0f} tok/s | r_max {rf:.2f} act_min {na} col {col}")
+            else:
+                print(f"iter {it:6d} | loss {avg_loss:.4f} | lr {lr:.3e} | {tps:.0f} tok/s")
             t0 = time.time(); tokens_seen = 0
 
         # Eval
@@ -642,6 +801,7 @@ def main():
     p.set_defaults(dropless=True)
     p.add_argument('--load_balance_alpha', type=float, default=0.05)
     p.add_argument('--router_z_loss_coef', type=float, default=0.0)
+    p.add_argument('--attn_gate', type=str, default='none', choices=['none', 'sigmoid_head'], help='Enable SDPA + elementwise head-specific sigmoid gate')
 
     # Train
     p.add_argument('--device', type=str, default='cuda')
