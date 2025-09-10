@@ -532,3 +532,48 @@ How to use
 Collapse check: watch router/max_frac_max (→ 1.0 is bad), router/active_min (→ 1 is bad), router/entropy_mean (drops), router/top1_p_mean (shoots up).
 Capacity mode: router/drop_frac_mean > 0 indicates capacity hits; consider raising capacity_factor or reducing batch size/n_experts, or switch to dropless.
 Expect router/max_frac_max to settle <0.8, active_min close to n_experts (or at least >2), entropy to stop free‑fall, and val loss to remain stable.
+
+
+python model_experimental.py --device cuda --data_path /workspace/yxanul_v1/mixed_6b/train.bin --batch_size 12 --gradient_accumulation_steps 12 --n_experts 8 --at
+tn_gate sigmoid_head --seed 1337 --capacity_factor 1.1 --load_balance_alpha 0.1 --router_z_loss_coef 1e-4 --router_temp_init 1.7 --router_temp_final 1.0 --router_temp_anneal_iters 2000 --router_noise_
+std_init 0.7 --router_noise_decay_iters 2000 --no-dropless --learning_rate 1.5e-3
+Estimated params/expert (SwiGLU): ~2.10M for d=512
+Model params: 202,951,248 (202.95M)
+Config: layers=10, d_model=512, heads=8, experts=8
+iter      0 | loss 10.5955 | lr 7.500e-06 | 93544 tok/s | r_max 0.19 act_min 8 col 0
+eval | val_loss 10.6056
+iter     10 | loss 9.8745 | lr 8.250e-05 | 109929 tok/s | r_max 0.26 act_min 8 col 0
+iter     20 | loss 9.1901 | lr 1.575e-04 | 107869 tok/s | r_max 0.25 act_min 8 col 0
+iter     30 | loss 8.2951 | lr 2.325e-04 | 126790 tok/s | r_max 0.42 act_min 8 col 0
+iter     40 | loss 7.6269 | lr 3.075e-04 | 121043 tok/s | r_max 0.41 act_min 8 col 0
+iter     50 | loss 7.3728 | lr 3.825e-04 | 120606 tok/s | r_max 0.89 act_min 8 col 0
+iter     60 | loss 7.1187 | lr 4.575e-04 | 128397 tok/s | r_max 0.86 act_min 8 col 0
+iter     70 | loss 6.9523 | lr 5.325e-04 | 121178 tok/s | r_max 0.82 act_min 8 col 0
+iter     80 | loss 6.6974 | lr 6.075e-04 | 128515 tok/s | r_max 0.84 act_min 8 col 0
+iter     90 | loss 6.4426 | lr 6.825e-04 | 119780 tok/s | r_max 0.83 act_min 8 col 0
+iter    100 | loss 6.1992 | lr 7.575e-04 | 119852 tok/s | r_max 0.82 act_min 8 col 0
+iter    110 | loss 6.2223 | lr 8.325e-04 | 127744 tok/s | r_max 0.83 act_min 8 col 0
+iter    120 | loss 5.9268 | lr 9.075e-04 | 119929 tok/s | r_max 0.83 act_min 8 col 0
+iter    130 | loss 5.6093 | lr 9.825e-04 | 127640 tok/s | r_max 0.83 act_min 8 col 0
+iter    140 | loss 5.6553 | lr 1.058e-03 | 120202 tok/s | r_max 0.78 act_min 8 col 0
+iter    150 | loss 5.6356 | lr 1.133e-03 | 118522 tok/s | r_max 0.81 act_min 8 col 0
+iter    160 | loss 5.5474 | lr 1.208e-03 | 127421 tok/s | r_max 0.72 act_min 8 col 0
+iter    170 | loss 5.2983 | lr 1.283e-03 | 119706 tok/s | r_max 0.70 act_min 8 col 0
+iter    180 | loss 5.2804 | lr 1.358e-03 | 127275 tok/s | r_max 0.65 act_min 8 col 0
+iter    190 | loss 5.0644 | lr 1.433e-03 | 120142 tok/s | r_max 0.58 act_min 8 col 0
+iter    200 | loss 4.9361 | lr 1.500e-03 | 120436 tok/s | r_max 0.55 act_min 8 col 0
+eval | val_loss 4.1684
+
+
+
+What to try next (quick knobs)
+
+If you keep capacity mode (speed-first):
+Raise --capacity_factor to 1.20–1.25 to target drop_frac_mean ≤ 0.12.
+Keep --load_balance_alpha 0.08–0.10, --router_z_loss_coef 1e-4.
+Set a temperature floor: --router_temp_final 1.1 (prevents over‑sharpening late).
+If you switch to dropless (quality-first):
+Use --dropless and keep the same balance/z‑loss + temp floor (slightly slower but no lost signal).
+Optionally run dropless for 1–2k steps, then resume capacity mode for budget.
+
+
