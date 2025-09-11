@@ -577,3 +577,5 @@ Use --dropless and keep the same balance/z‑loss + temp floor (slightly slower 
 Optionally run dropless for 1–2k steps, then resume capacity mode for budget.
 
 
+Train with Expert Choice + GQA:
+python model_experimental.py --device cuda --data_path data_new/train.bin --batch_size 12 --gradient_accumulation_steps 12 --n_experts 8 --attn_gate sigmoid_head --seed 1337 --capacity_factor 1.1 --load_balance_alpha 0.1 --router_z_loss_coef 1e-4 --router_temp_init 1.7 --router_temp_final 1.0 --router_temp_anneal_iters 2000 --router_noise_std_init 0.7 --router_noise_decay_iters 2000 --no-dropless --learning_rate 1.5e-3 --router_type expert_choice --n_kv_heads 3

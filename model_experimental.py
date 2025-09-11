@@ -212,8 +212,131 @@ class Top1Router(nn.Module):
         return probs, top1_idx, top1_prob, aux, me, ce, entropy_mean
 
 
+class ExpertChoiceRouter(nn.Module):
+    """Expert Choice routing (2202.09368): experts pick tokens.
+
+    Each expert selects up to `capacity = ceil(capacity_factor * N / E)` tokens
+    it prefers based on gate scores. Tokens selected by multiple experts are
+    greedily assigned to the expert with the highest score, subject to capacity.
+    Remaining tokens are assigned to their best-available expert respecting
+    capacity when possible. If `dropless=True` and all capacities are full,
+    overflow is allowed to keep all tokens (rare with capacity_factor>=1.0).
+    """
+    def __init__(self, d_model: int, n_experts: int, capacity_factor: float = 1.25, dropless: bool = True,
+                 load_balance_alpha: float = 0.05, router_z_loss_coef: float = 0.0,
+                 temperature: float = 1.0, noise_std: float = 0.0, noise_type: str = 'gumbel'):
+        super().__init__()
+        self.n_experts = n_experts
+        self.capacity_factor = capacity_factor
+        self.dropless = dropless
+        self.load_balance_alpha = load_balance_alpha
+        self.router_z_loss_coef = router_z_loss_coef
+        self.w_gating = nn.Linear(d_model, n_experts, bias=True)
+        # routing dynamics
+        self.temperature = float(temperature)
+        self.noise_std = float(noise_std)
+        self.noise_type = str(noise_type)
+
+    @torch.no_grad()
+    def set_router_state(self, temperature: Optional[float] = None, noise_std: Optional[float] = None):
+        if temperature is not None:
+            self.temperature = float(temperature)
+        if noise_std is not None:
+            self.noise_std = float(noise_std)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x: [N, D]
+        logits = self.w_gating(x)  # [N, E]
+        temp = max(1e-5, float(self.temperature))
+        logits_base = logits / temp
+        probs = F.softmax(logits_base, dim=-1)
+
+        # Optional noise (used only for selection priority, not aux stats)
+        logits_sel = logits_base
+        if self.training and self.noise_std > 1e-8:
+            if self.noise_type == 'gumbel':
+                u = torch.rand_like(logits_sel).clamp_(1e-6, 1 - 1e-6)
+                g = -torch.log(-torch.log(u))
+                logits_sel = logits_sel + self.noise_std * g
+            else:  # gaussian
+                logits_sel = logits_sel + self.noise_std * torch.randn_like(logits_sel)
+
+        N, E = probs.shape
+        device = probs.device
+        # Capacity per expert
+        cap = int(math.ceil(self.capacity_factor * (N / max(1, E))))
+        cap = max(1, cap)
+
+        # Expert preselection: top-`cap` tokens per expert by selection logits
+        # Note: we use logits_sel for ordering; use probs for aux weighting.
+        topk_idx_list = []
+        for e in range(E):
+            scores_e = logits_sel[:, e]
+            k = min(cap, N)
+            # topk over dim=0
+            vals_e, idx_e = torch.topk(scores_e, k=k, dim=0, sorted=True)
+            topk_idx_list.append(idx_e)
+
+        assigned = torch.full((N,), -1, dtype=torch.long, device=device)
+        load = torch.zeros((E,), dtype=torch.int32, device=device)
+
+        # Greedy expert-first assignment in descending token score per expert
+        for e in range(E):
+            idx_e = topk_idx_list[e]
+            # Iterate tokens for expert e in order of preference
+            for j in idx_e:
+                if assigned[j] == -1 and int(load[e]) < cap:
+                    assigned[j] = e
+                    load[e] = load[e] + 1
+
+        # Fallback assignment for any unassigned tokens
+        unassigned = (assigned == -1).nonzero(as_tuple=False).squeeze(-1)
+        if unassigned.numel() > 0:
+            # Rank experts per token by selection logits (descending)
+            # Take full sort since E is small (<=16 typical)
+            _, expert_rank = torch.sort(logits_sel[unassigned], dim=-1, descending=True)
+            for i_tok in range(unassigned.size(0)):
+                t = unassigned[i_tok]
+                # Try experts in order until capacity allows
+                placed = False
+                for k in range(expert_rank.size(1)):
+                    e = expert_rank[i_tok, k].item()
+                    if int(load[e]) < cap or self.dropless:
+                        assigned[t] = e
+                        load[e] = load[e] + 1
+                        placed = True
+                        break
+                if not placed:
+                    # As a final fallback (dropless=False and all at cap), drop token
+                    pass
+
+        # Chosen prob for assigned expert (0 if not assigned)
+        chosen = assigned.clamp_min(0)
+        top1_prob = probs.gather(-1, chosen.view(-1, 1)).squeeze(-1)
+        top1_prob = torch.where(assigned >= 0, top1_prob, top1_prob.new_zeros(()).expand_as(top1_prob))
+
+        # Load balancing aux: Switch-style
+        with torch.no_grad():
+            one_hot_assign = F.one_hot(chosen.clamp_min(0), num_classes=E).float()
+            valid_mask = (assigned >= 0).float().unsqueeze(-1)
+            one_hot_assign = one_hot_assign * valid_mask  # zero out unassigned
+            me = one_hot_assign.mean(dim=0)  # [E]
+            ce = probs.mean(dim=0)          # [E] mean gate prob (over all tokens)
+            entropy_mean = (-(probs.clamp_min(1e-9).log() * probs).sum(dim=-1)).mean()
+        aux = (self.n_experts * (me * ce).sum())
+        aux = self.load_balance_alpha * aux
+
+        # Optional z-loss on router logits (stabilizes softmax)
+        if self.router_z_loss_coef > 0.0:
+            z = torch.logsumexp(logits.float(), dim=-1)
+            z_loss = (z.square()).mean() * self.router_z_loss_coef
+            aux = aux + z_loss.to(aux.dtype)
+
+        return probs, assigned, top1_prob, aux, me, ce, entropy_mean
+
+
 class MoE(nn.Module):
-    """Mixture-of-Experts with top-1 routing.
+    """Mixture-of-Experts with configurable routing (top-1 or Expert Choice).
 
     Implementation emphasizes simplicity for small models and BF16 speed.
     Uses dropless routing by default: every token is processed by its selected expert.
@@ -222,15 +345,22 @@ class MoE(nn.Module):
                  capacity_factor: float = 1.25, dropless: bool = True,
                  load_balance_alpha: float = 0.05, router_z_loss_coef: float = 0.0,
                  router_temperature: float = 1.0, router_noise_std: float = 0.0, router_noise_type: str = 'gumbel',
-                 grouped: bool = False):
+                 grouped: bool = False, router_type: str = 'token_top1'):
         super().__init__()
         self.n_experts = n_experts
         self.grouped = bool(grouped)
-        self.router = Top1Router(
-            d_model, n_experts, capacity_factor, dropless,
-            load_balance_alpha, router_z_loss_coef,
-            temperature=router_temperature, noise_std=router_noise_std, noise_type=router_noise_type,
-        )
+        if router_type == 'expert_choice':
+            self.router = ExpertChoiceRouter(
+                d_model, n_experts, capacity_factor, dropless,
+                load_balance_alpha, router_z_loss_coef,
+                temperature=router_temperature, noise_std=router_noise_std, noise_type=router_noise_type,
+            )
+        else:
+            self.router = Top1Router(
+                d_model, n_experts, capacity_factor, dropless,
+                load_balance_alpha, router_z_loss_coef,
+                temperature=router_temperature, noise_std=router_noise_std, noise_type=router_noise_type,
+            )
         self.experts = nn.ModuleList([
             ExpertSwiGLU(d_model, bias=bias, dropout=dropout) for _ in range(n_experts)
         ])
@@ -417,7 +547,8 @@ class MoE(nn.Module):
 # --------------------------- Transformer blocks ---------------------------
 
 class MultiheadAttention(nn.Module):
-    def __init__(self, d_model: int, n_head: int, bias: bool = False, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_head: int, bias: bool = False, dropout: float = 0.0,
+                 qk_norm: bool = False, qk_norm_eps: float = 1e-6):
         super().__init__()
         assert d_model % n_head == 0
         self.d_model = d_model
@@ -428,6 +559,10 @@ class MultiheadAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=bias)
         self.o_proj = nn.Linear(d_model, d_model, bias=bias)
         self.dropout_p = float(dropout)
+        self.qk_norm = bool(qk_norm)
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=qk_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=qk_norm_eps)
 
     def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
         b, t, d = x.shape
@@ -435,6 +570,10 @@ class MultiheadAttention(nn.Module):
         q = self.q_proj(x).view(b, t, h, -1).transpose(1, 2)  # [b,h,t,d]
         k = self.k_proj(x).view(b, t, h, -1).transpose(1, 2)
         v = self.v_proj(x).view(b, t, h, -1).transpose(1, 2)
+        # QK-Norm before RoPE
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         # Optional RoPE
         if rope_cache is not None:
             cos, sin = rope_cache
@@ -458,7 +597,8 @@ class GatedMultiheadAttention(nn.Module):
     Gate is computed from the input x via a linear projection with sigmoid.
     Then applied multiplicatively to the attention output per-head before o_proj.
     """
-    def __init__(self, d_model: int, n_head: int, bias: bool = False, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_head: int, bias: bool = False, dropout: float = 0.0,
+                 qk_norm: bool = False, qk_norm_eps: float = 1e-6):
         super().__init__()
         assert d_model % n_head == 0
         self.d_model = d_model
@@ -471,6 +611,10 @@ class GatedMultiheadAttention(nn.Module):
         # Gate projection (head-specific via reshape)
         self.gate_proj = nn.Linear(d_model, d_model, bias=bias)
         self.dropout_p = float(dropout)
+        self.qk_norm = bool(qk_norm)
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=qk_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=qk_norm_eps)
 
     def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
         b, t, d = x.shape
@@ -478,6 +622,10 @@ class GatedMultiheadAttention(nn.Module):
         q = self.q_proj(x).view(b, t, h, -1).transpose(1, 2)  # [b,h,t,d_head]
         k = self.k_proj(x).view(b, t, h, -1).transpose(1, 2)
         v = self.v_proj(x).view(b, t, h, -1).transpose(1, 2)
+        # QK-Norm before RoPE
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         # Optional RoPE
         if rope_cache is not None:
             cos, sin = rope_cache
@@ -501,25 +649,146 @@ class GatedMultiheadAttention(nn.Module):
         return y
 
 
+class GQA(nn.Module):
+    """Grouped-Query Attention: Q has n_head, K/V have n_kv_heads, n_head % n_kv_heads == 0.
+    Replicates K/V across groups to match Q heads, then uses SDPA.
+    """
+    def __init__(self, d_model: int, n_head: int, n_kv_heads: int, bias: bool = False, dropout: float = 0.0,
+                 qk_norm: bool = False, qk_norm_eps: float = 1e-6):
+        super().__init__()
+        assert d_model % n_head == 0
+        assert n_head % n_kv_heads == 0
+        self.d_model = d_model
+        self.n_head = n_head
+        self.n_kv_heads = n_kv_heads
+        self.group_size = n_head // n_kv_heads
+        self.head_dim = d_model // n_head
+        self.q_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.k_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=bias)
+        self.v_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=bias)
+        self.o_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.dropout_p = float(dropout)
+        self.qk_norm = bool(qk_norm)
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=qk_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=qk_norm_eps)
+
+    def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
+        b, t, d = x.shape
+        h = self.n_head
+        hk = self.n_kv_heads
+        q = self.q_proj(x).view(b, t, h, -1).transpose(1, 2)      # [b,h,t,dh]
+        k = self.k_proj(x).view(b, t, hk, -1).transpose(1, 2)     # [b,hk,t,dh]
+        v = self.v_proj(x).view(b, t, hk, -1).transpose(1, 2)     # [b,hk,t,dh]
+        # QK-Norm before RoPE (apply to q and k; k per kv-head)
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        if rope_cache is not None:
+            cos, sin = rope_cache
+            q = RoPE.apply_rope(q, cos, sin)
+            k = RoPE.apply_rope(k, cos, sin)
+        # replicate kv along head groups
+        if hk != h:
+            k = k.repeat_interleave(self.group_size, dim=1)  # [b,h,t,dh]
+            v = v.repeat_interleave(self.group_size, dim=1)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=True,
+        )
+        y = y.transpose(1, 2).contiguous().view(b, t, d)
+        y = self.o_proj(y)
+        return y
+
+
+class GatedGQA(nn.Module):
+    def __init__(self, d_model: int, n_head: int, n_kv_heads: int, bias: bool = False, dropout: float = 0.0,
+                 qk_norm: bool = False, qk_norm_eps: float = 1e-6):
+        super().__init__()
+        assert d_model % n_head == 0
+        assert n_head % n_kv_heads == 0
+        self.d_model = d_model
+        self.n_head = n_head
+        self.n_kv_heads = n_kv_heads
+        self.group_size = n_head // n_kv_heads
+        self.head_dim = d_model // n_head
+        self.q_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.k_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=bias)
+        self.v_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=bias)
+        self.o_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.gate_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.dropout_p = float(dropout)
+        self.qk_norm = bool(qk_norm)
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=qk_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=qk_norm_eps)
+
+    def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
+        b, t, d = x.shape
+        h = self.n_head
+        hk = self.n_kv_heads
+        q = self.q_proj(x).view(b, t, h, -1).transpose(1, 2)
+        k = self.k_proj(x).view(b, t, hk, -1).transpose(1, 2)
+        v = self.v_proj(x).view(b, t, hk, -1).transpose(1, 2)
+        # QK-Norm before RoPE
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        if rope_cache is not None:
+            cos, sin = rope_cache
+            q = RoPE.apply_rope(q, cos, sin)
+            k = RoPE.apply_rope(k, cos, sin)
+        if hk != h:
+            k = k.repeat_interleave(self.group_size, dim=1)
+            v = v.repeat_interleave(self.group_size, dim=1)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=True,
+        )
+        gate = torch.sigmoid(self.gate_proj(x)).view(b, t, h, -1).transpose(1, 2)
+        y = y * gate
+        y = y.transpose(1, 2).contiguous().view(b, t, d)
+        y = self.o_proj(y)
+        return y
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, bias: bool, dropout: float,
+    def __init__(self, d_model: int, n_head: int, n_kv_heads: int, bias: bool, dropout: float,
                  n_experts: int, capacity_factor: float, dropless: bool,
                  load_balance_alpha: float, router_z_loss_coef: float,
-                 attn_gate: str = 'none', use_rope: bool = True):
+                 attn_gate: str = 'none', use_rope: bool = True,
+                 router_type: str = 'token_top1',
+                 qk_norm: bool = False, qk_norm_eps: float = 1e-6):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
         self.use_rope = use_rope
-        if attn_gate == 'sigmoid_head':
-            self.attn = GatedMultiheadAttention(d_model, n_head, bias=bias, dropout=dropout)
+        self.n_head = n_head
+        self.n_kv_heads = n_kv_heads
+        if n_kv_heads < n_head:
+            if attn_gate == 'sigmoid_head':
+                self.attn = GatedGQA(d_model, n_head, n_kv_heads, bias=bias, dropout=dropout,
+                                     qk_norm=qk_norm, qk_norm_eps=qk_norm_eps)
+            else:
+                self.attn = GQA(d_model, n_head, n_kv_heads, bias=bias, dropout=dropout,
+                                qk_norm=qk_norm, qk_norm_eps=qk_norm_eps)
         else:
-            self.attn = MultiheadAttention(d_model, n_head, bias=bias, dropout=dropout)
+            if attn_gate == 'sigmoid_head':
+                self.attn = GatedMultiheadAttention(d_model, n_head, bias=bias, dropout=dropout,
+                                                    qk_norm=qk_norm, qk_norm_eps=qk_norm_eps)
+            else:
+                self.attn = MultiheadAttention(d_model, n_head, bias=bias, dropout=dropout,
+                                               qk_norm=qk_norm, qk_norm_eps=qk_norm_eps)
         self.ln2 = RMSNorm(d_model)
         self.moe = MoE(
             d_model, n_experts, bias=bias, dropout=dropout,
             capacity_factor=capacity_factor, dropless=dropless,
             load_balance_alpha=load_balance_alpha, router_z_loss_coef=router_z_loss_coef,
             router_temperature=1.0, router_noise_std=0.0, router_noise_type='gumbel',
-            grouped=False,
+            grouped=False, router_type=router_type,
         )
 
     def forward(self, x: torch.Tensor, rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -536,6 +805,7 @@ class TinyMoETransformer(nn.Module):
                  vocab_size: int = 32768,
                  n_layer: int = 10,
                  n_head: int = 8,
+                 n_kv_heads: Optional[int] = None,
                  d_model: int = 512,
                  block_size: int = 2048,
                  dropout: float = 0.0,
@@ -546,12 +816,15 @@ class TinyMoETransformer(nn.Module):
                  load_balance_alpha: float = 0.05,
                  router_z_loss_coef: float = 0.0,
                  attn_gate: str = 'none',
+                 router_type: str = 'token_top1',
                  router_temperature: float = 1.0,
                  router_noise_std: float = 0.0,
                  router_noise_type: str = 'gumbel',
                  use_rope: bool = True,
                  rope_theta: float = 10000.0,
                  moe_grouped: bool = False,
+                 qk_norm: bool = False,
+                 qk_norm_eps: float = 1e-6,
                  ):  # noqa: E501
         super().__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
@@ -560,6 +833,9 @@ class TinyMoETransformer(nn.Module):
         self.d_model = d_model
         self.use_rope = use_rope
         self.head_dim = d_model // n_head
+        self.n_head = n_head
+        self.n_kv_heads = n_head if n_kv_heads is None else int(n_kv_heads)
+        assert self.n_head % self.n_kv_heads == 0, "n_head must be a multiple of n_kv_heads"
         if self.use_rope:
             assert (self.head_dim % 2) == 0, "head_dim must be even for RoPE"
 
@@ -567,11 +843,14 @@ class TinyMoETransformer(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.h = nn.ModuleList([
             TransformerBlock(
-                d_model, n_head, bias, dropout,
+                d_model, n_head, self.n_kv_heads, bias, dropout,
                 n_experts, capacity_factor, dropless,
                 load_balance_alpha, router_z_loss_coef,
                 attn_gate=attn_gate,
                 use_rope=use_rope,
+                router_type=router_type,
+                qk_norm=qk_norm,
+                qk_norm_eps=qk_norm_eps,
             )
             for _ in range(n_layer)
         ])
@@ -660,6 +939,7 @@ class TrainConfig:
     vocab_size: int = 32768
     n_layer: int = 10
     n_head: int = 8
+    n_kv_heads: Optional[int] = None
     d_model: int = 512
     n_experts: int = 4
     block_size: int = 2048
@@ -670,8 +950,12 @@ class TrainConfig:
     load_balance_alpha: float = 0.05
     router_z_loss_coef: float = 0.0
     attn_gate: str = 'none'  # 'none' or 'sigmoid_head'
+    router_type: str = 'token_top1'  # 'token_top1' or 'expert_choice'
     use_rope: bool = True
     rope_theta: float = 10000.0
+    # QK-Norm
+    qk_norm: bool = False
+    qk_norm_eps: float = 1e-6
     # Router dynamics
     router_temp_init: float = 1.5
     router_temp_final: float = 1.0
@@ -799,6 +1083,7 @@ def train(cfg: TrainConfig):
         vocab_size=cfg.vocab_size,
         n_layer=cfg.n_layer,
         n_head=cfg.n_head,
+        n_kv_heads=cfg.n_kv_heads,
         d_model=cfg.d_model,
         block_size=cfg.block_size,
         dropout=cfg.dropout,
@@ -809,12 +1094,15 @@ def train(cfg: TrainConfig):
         load_balance_alpha=cfg.load_balance_alpha,
         router_z_loss_coef=cfg.router_z_loss_coef,
         attn_gate=cfg.attn_gate,
+        router_type=cfg.router_type,
         router_temperature=cfg.router_temp_init,
         router_noise_std=cfg.router_noise_std_init,
         router_noise_type=cfg.router_noise_type,
         use_rope=cfg.use_rope,
         rope_theta=cfg.rope_theta,
         moe_grouped=cfg.moe_grouped,
+        qk_norm=cfg.qk_norm,
+        qk_norm_eps=cfg.qk_norm_eps,
     ).to(device=device, dtype=torch.bfloat16)
 
     total_params = model.num_parameters()
@@ -1042,6 +1330,7 @@ def main():
     p.add_argument('--vocab_size', type=int, default=32768)
     p.add_argument('--n_layer', type=int, default=10)
     p.add_argument('--n_head', type=int, default=8)
+    p.add_argument('--n_kv_heads', type=int, default=None)
     p.add_argument('--d_model', type=int, default=512)
     p.add_argument('--n_experts', type=int, default=4)
     p.add_argument('--block_size', type=int, default=2048)
@@ -1054,10 +1343,14 @@ def main():
     p.add_argument('--load_balance_alpha', type=float, default=0.05)
     p.add_argument('--router_z_loss_coef', type=float, default=0.0)
     p.add_argument('--attn_gate', type=str, default='none', choices=['none', 'sigmoid_head'], help='Enable SDPA + elementwise head-specific sigmoid gate')
+    p.add_argument('--router_type', type=str, default='token_top1', choices=['token_top1', 'expert_choice'], help='Router: standard token-choice top1 or Expert Choice (2202.09368)')
     p.add_argument('--use_rope', dest='use_rope', action='store_true')
     p.add_argument('--no-use_rope', dest='use_rope', action='store_false')
     p.set_defaults(use_rope=True)
     p.add_argument('--rope_theta', type=float, default=10000.0)
+    # QK-Norm
+    p.add_argument('--qk_norm', action='store_true', help='Apply RMSNorm to Q and K before RoPE')
+    p.add_argument('--qk_norm_eps', type=float, default=1e-6)
     # Router dynamics CLI
     p.add_argument('--router_temp_init', type=float, default=1.5)
     p.add_argument('--router_temp_final', type=float, default=1.0)

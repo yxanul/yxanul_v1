@@ -31,7 +31,7 @@ from transformers import AutoTokenizer
 from model_experimental import TinyMoETransformer
 
 
-def load_model(ckpt_path: str, device: str = 'cuda') -> TinyMoETransformer:
+def load_model(ckpt_path: str, device: str = 'cuda') -> tuple[TinyMoETransformer, dict]:
     ckpt = torch.load(ckpt_path, map_location=device)
     cfg = ckpt.get('cfg', {})
 
@@ -61,7 +61,11 @@ def load_model(ckpt_path: str, device: str = 'cuda') -> TinyMoETransformer:
     for blk in model.h:
         if hasattr(blk, 'moe'):
             blk.moe.router.set_router_state(temperature=1.0, noise_std=0.0)
-    return model
+    return model, {
+        'iter': ckpt.get('iter', None),
+        'val_loss': ckpt.get('val_loss', None),
+        'cfg': cfg,
+    }
 
 
 def build_prompt(history: List[dict], system: str | None = None) -> str:
@@ -117,10 +121,13 @@ def _top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 0, top_p: float = 
 def sample_candidates(model: TinyMoETransformer, tokenizer: AutoTokenizer, prompt: str,
                       k: int = 5, max_new_tokens: int = 256, temperature: float = 0.9,
                       top_k: int = 50, top_p: float = 0.9, repetition_penalty: float = 1.1,
-                      device: str = 'cuda', seed: int | None = None) -> List[str]:
+                      device: str = 'cuda', seed: int | None = None,
+                      add_bos: bool = False) -> List[str]:
     # Encode prompt
-    input_ids = tokenizer.encode(prompt, add_special_tokens=False)
-    input_ids = torch.tensor([input_ids], device=device)
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+    if add_bos and tokenizer.bos_token_id is not None:
+        ids = [int(tokenizer.bos_token_id)] + ids
+    input_ids = torch.tensor([ids], device=device)
     # Trim to block size if needed
     if input_ids.size(1) > model.block_size:
         input_ids = input_ids[:, -model.block_size:]
@@ -165,13 +172,23 @@ def main():
     ap.add_argument('--max_new_tokens', type=int, default=256)
     ap.add_argument('--seed', type=int, default=1337)
     ap.add_argument('--system', type=str, default='You are a helpful assistant.')
+    ap.add_argument('--add_bos', action='store_true', help='Prepend BOS token to the prompt before sampling')
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    model = load_model(args.ckpt, device=str(device))
+    model, meta = load_model(args.ckpt, device=str(device))
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True, trust_remote_code=False)
 
     print('\nLoaded checkpoint:', args.ckpt)
+    if meta.get('iter') is not None or meta.get('val_loss') is not None:
+        print('Checkpoint info:', f"iter={meta.get('iter')}, val_loss={meta.get('val_loss')}")
+    # Vocab sanity check
+    try:
+        tok_len = len(tokenizer)
+        if hasattr(model, 'vocab_size') and tok_len != int(model.vocab_size):
+            print(f"WARNING: tokenizer size ({tok_len}) != model.vocab_size ({model.vocab_size}). Decoding may be incorrect.")
+    except Exception:
+        pass
     print('Device:', device)
     print('Sampling:', f'k={args.k}, temperature={args.temperature}, top_k={args.top_k}, top_p={args.top_p}, rep_pen={args.repetition_penalty}')
     print('Max new tokens:', args.max_new_tokens)
@@ -197,7 +214,7 @@ def main():
             k=args.k, max_new_tokens=args.max_new_tokens,
             temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
-            device=str(device), seed=args.seed,
+            device=str(device), seed=args.seed, add_bos=args.add_bos,
         )
 
         # Show candidates
